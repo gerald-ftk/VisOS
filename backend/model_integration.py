@@ -79,6 +79,11 @@ class ModelManager:
                 if url_entry:
                     stem = Path(url_entry[0]).stem
                     stem_to_catalog[stem] = entry
+        # RF-DETR filenames (downloaded to workspace/models/ via chdir)
+        for rfdetr_id, rfdetr_stem in self._RFDETR_FILENAMES.items():
+            catalog = next((e for e in self._PRETRAINED_CATALOG if e["id"] == rfdetr_id), None)
+            if catalog:
+                stem_to_catalog[Path(rfdetr_stem).stem] = catalog
 
         # 1. In-memory loaded models (highest priority)
         for model_id, info in self.loaded_models.items():
@@ -258,6 +263,12 @@ class ModelManager:
         "yoloworld_s": ("yolov8s-worldv2.pt", "https://github.com/ultralytics/assets/releases/download/v8.3.0/yolov8s-worldv2.pt"),
         "yoloworld_m": ("yolov8m-worldv2.pt", "https://github.com/ultralytics/assets/releases/download/v8.3.0/yolov8m-worldv2.pt"),
         "yoloworld_l": ("yolov8l-worldv2.pt", "https://github.com/ultralytics/assets/releases/download/v8.3.0/yolov8l-worldv2.pt"),
+    }
+
+    # RF-DETR expected filenames in workspace/models/
+    _RFDETR_FILENAMES = {
+        "rfdetr_base":  "rf-detr-base.pth",
+        "rfdetr_large": "rf-detr-large.pth",
     }
 
     # GroundingDINO HuggingFace model IDs (downloaded on first use via transformers)
@@ -644,15 +655,33 @@ class ModelManager:
 
         try:
             from rfdetr import RFDETRBase, RFDETRLarge
-            if model_name == "rfdetr_large":
-                model = RFDETRLarge()
-                model_info["name"] = "RF-DETR Large"
-            else:
-                model = RFDETRBase()
-                model_info["name"] = "RF-DETR Base"
+            # rfdetr downloads weights to cwd — chdir to models_dir so they land there
+            _prev_cwd = os.getcwd()
+            os.chdir(str(self.models_dir))
+            try:
+                if model_name == "rfdetr_large":
+                    model = RFDETRLarge()
+                    model_info["name"] = "RF-DETR Large"
+                else:
+                    model = RFDETRBase()
+                    model_info["name"] = "RF-DETR Base"
+            finally:
+                os.chdir(_prev_cwd)
             model_info["model"] = model
             model_info["loaded"] = True
             model_info["downloaded"] = True
+            # Ensure the downloaded .pth is stored under the canonical filename so
+            # list_models() can find it on disk.  rfdetr may use a versioned name
+            # (e.g. rf-detr-large-2026.pth) — rename to the canonical one.
+            canonical = self._RFDETR_FILENAMES[model_name]
+            canonical_path = self.models_dir / canonical
+            if not canonical_path.exists():
+                import glob as _glob
+                pattern = str(self.models_dir / "rf-detr-large*.pth") if model_name == "rfdetr_large" else str(self.models_dir / "rf-detr-base*.pth")
+                matches = [p for p in _glob.glob(pattern) if Path(p).name != canonical]
+                if matches:
+                    import shutil
+                    shutil.copy2(matches[0], canonical_path)
             # RF-DETR is COCO-pretrained — 80 standard classes
             model_info["classes"] = [
                 "person","bicycle","car","motorcycle","airplane","bus","train","truck","boat",
@@ -1306,18 +1335,22 @@ class ModelManager:
         image_id = image_path.stem
         
         if format_name in ["yolo", "yolov5", "yolov8", "yolov9", "yolov10", "yolov11", "yolov12"]:
-            # Determine labels directory — mirror the image's own split folder so
-            # e.g. train/images/x.jpg → train/labels/x.txt
-            #      valid/images/x.jpg → valid/labels/x.txt
-            #      images/x.jpg       → labels/x.txt
+            # Determine labels directory — mirror the image's split/images folder.
+            # Works for flat, nested, and multi-depth datasets:
+            #   images/x.jpg              → labels/x.txt
+            #   train/images/x.jpg        → train/labels/x.txt
+            #   myds/train/images/x.jpg   → myds/train/labels/x.txt
             try:
                 rel_parts = image_path.relative_to(dataset_path).parts
-                if len(rel_parts) >= 2 and rel_parts[1].lower() in ("images", "imgs"):
-                    labels_dir = dataset_path / rel_parts[0] / "labels"
-                elif len(rel_parts) >= 1 and rel_parts[0].lower() in ("images", "imgs"):
-                    labels_dir = dataset_path / "labels"
+                # Find the 'images' or 'imgs' directory anywhere in the path
+                img_idx = next(
+                    (i for i, p in enumerate(rel_parts) if p.lower() in ("images", "imgs")),
+                    None
+                )
+                if img_idx is not None:
+                    labels_dir = dataset_path.joinpath(*rel_parts[:img_idx]) / "labels"
                 else:
-                    raise ValueError("non-standard path")
+                    raise ValueError("no 'images' segment in path")
             except Exception:
                 # Fallback: use train/labels if it exists, otherwise root labels
                 labels_dir = dataset_path / "labels"

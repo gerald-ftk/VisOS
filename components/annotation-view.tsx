@@ -8,9 +8,9 @@ import { Input } from '@/components/ui/input'
 import {
   MousePointer2, Square, Pentagon, Wand2, Save, Trash2,
   ChevronLeft, ChevronRight, ZoomIn, ZoomOut, RotateCcw,
-  Layers, AlertCircle, Loader2, Undo2, FolderOpen, Tag,
-  Circle, Brush, Crosshair, Copy, Search, ChevronsRight, Keyboard,
-  Download, CheckCircle2, X, Plus, BarChart2, Pause, Play, StopCircle
+  AlertCircle, Loader2, Undo2, FolderOpen, Tag,
+  Brush, Crosshair, ChevronsRight, Keyboard,
+  Download, CheckCircle2, X, Plus, Pause, Play, StopCircle
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import type { Dataset, ImageData, Annotation, ImageCache } from '@/app/page'
@@ -22,7 +22,7 @@ const PRELOAD_AHEAD = 3
 
 interface BatchJobState {
   job_id: string
-  status: 'running' | 'paused' | 'done' | 'error' | 'cancelled'
+  status: 'running' | 'paused' | 'done' | 'error' | 'cancelled' | 'interrupted'
   paused: boolean
   progress: number
   total: number
@@ -32,8 +32,9 @@ interface BatchJobState {
   total_annotations: number
   error?: string
   text_prompt: string
-  started_at: number  // Date.now() ms
+  started_at: string | number  // ISO string from backend or Date.now() ms
   dataset_id: string
+  recent_images?: Array<{ filename: string; path: string; annotation_count: number }>
 }
 
 interface AnnotationViewProps {
@@ -106,8 +107,8 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
   // Batch job tracking: job_id → BatchJobState
   const [batchJobs, setBatchJobs] = useState<Record<string, BatchJobState>>({})
   const [isStartingBatch, setIsStartingBatch] = useState(false)
-  // 'annotate' shows the canvas; 'batch' shows the job-monitor overlay
-  const [mainView, setMainView] = useState<'annotate' | 'batch'>('annotate')
+  // Right sidebar tab: 'annotate' = auto-annotate settings, 'jobs' = batch job monitor
+  const [sidebarTab, setSidebarTab] = useState<'annotate' | 'jobs'>('annotate')
 
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
@@ -137,22 +138,47 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
     try { localStorage.setItem('cvdm_batchJobs', JSON.stringify(batchJobs)) } catch {}
   }, [batchJobs])
 
-  // ── Restore batch jobs from localStorage on first mount ──────────────────────
-  // (runs once; re-polls any jobs that were still active when the tab was left)
+  // ── Restore batch jobs from backend on first mount ───────────────────────────
+  // Backend persists jobs to disk; on restart they survive with updated statuses.
+  // We also fall back to localStorage for jobs the backend doesn't know about.
   useEffect(() => {
-    try {
-      const saved = localStorage.getItem('cvdm_batchJobs')
-      if (!saved) return
-      const jobs: Record<string, BatchJobState> = JSON.parse(saved)
-      if (Object.keys(jobs).length === 0) return
-      setBatchJobs(jobs)
-      // Re-establish polling for any jobs that weren't finished
-      Object.values(jobs).forEach(job => {
-        if (job.status === 'running' || job.status === 'paused') {
-          _pollJob(job.job_id)
+    const restore = async () => {
+      try {
+        // Try backend first (authoritative after restart)
+        const r = await fetch(`${apiUrl}/api/auto-annotate/jobs`)
+        if (r.ok) {
+          const data = await r.json()
+          const backendJobs: Record<string, BatchJobState> = {}
+          for (const job of (data.jobs || [])) {
+            backendJobs[job.job_id] = job
+          }
+          if (Object.keys(backendJobs).length > 0) {
+            setBatchJobs(backendJobs)
+            // Poll any still-running jobs
+            Object.values(backendJobs).forEach(job => {
+              if (job.status === 'running' || job.status === 'paused') {
+                _pollJob(job.job_id)
+              }
+            })
+            return
+          }
         }
-      })
-    } catch {}
+      } catch {}
+      // Fallback: localStorage
+      try {
+        const saved = localStorage.getItem('cvdm_batchJobs')
+        if (!saved) return
+        const jobs: Record<string, BatchJobState> = JSON.parse(saved)
+        if (Object.keys(jobs).length === 0) return
+        setBatchJobs(jobs)
+        Object.values(jobs).forEach(job => {
+          if (job.status === 'running' || job.status === 'paused') {
+            _pollJob(job.job_id)
+          }
+        })
+      } catch {}
+    }
+    restore()
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Load image list ──────────────────────────────────────────────────────────
@@ -855,10 +881,10 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
     pollIntervalsRef.current[job_id] = iv
   }
 
-  // When switching back to the annotation canvas, refresh the current image's
-  // annotations from the backend so batch results are immediately visible.
+  // When switching to annotate tab, refresh the current image's annotations
+  // from the backend so batch results are immediately visible.
   useEffect(() => {
-    if (mainView !== 'annotate') return
+    if (sidebarTab !== 'annotate') return
     const ds = selectedDatasetRef.current
     const img = currentImageRef.current
     if (!ds || !img) return
@@ -874,7 +900,7 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
         }
       } catch {}
     })()
-  }, [mainView]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [sidebarTab]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const textAnnotateSingle = async () => {
     if (!selectedDataset || !currentImage || !selectedModel || !combinedPrompt) return
@@ -938,12 +964,13 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
           failed: 0,
           total_annotations: 0,
           text_prompt: combinedPrompt,
-          started_at: Date.now(),
+          started_at: new Date().toISOString(),
           dataset_id: selectedDataset.id,
+          recent_images: [],
         },
       }))
       toast.success(`Batch job started (${combinedPrompt})`)
-      setMainView('batch')
+      setSidebarTab('jobs')
       _pollJob(job_id)
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Batch annotation failed')
@@ -1068,19 +1095,22 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
   }
 
   // ── Elapsed time helper ───────────────────────────────────────────────────────
-  const fmtElapsed = (startedAt: number) => {
-    const s = Math.floor((Date.now() - startedAt) / 1000)
+  const fmtElapsed = (startedAt: string | number) => {
+    const ms = typeof startedAt === 'number' ? startedAt : new Date(startedAt).getTime()
+    const s = Math.floor((Date.now() - ms) / 1000)
+    if (s < 0 || isNaN(s)) return '—'
     if (s < 60) return `${s}s`
     const m = Math.floor(s / 60)
     return `${m}m ${s % 60}s`
   }
 
   const runningJobCount = Object.values(batchJobs).filter(j => j.status === 'running' || j.status === 'paused').length
+  const totalJobCount = Object.keys(batchJobs).length
 
   // ── Main UI ──────────────────────────────────────────────────────────────────
   return (
     <div className="h-full flex">
-      {/* Canvas / batch-monitor side */}
+      {/* Canvas side — always visible */}
       <div className="flex-1 flex flex-col min-w-0">
         {/* Toolbar */}
         <div className="flex items-center gap-2 p-2 border-b border-border bg-card flex-wrap">
@@ -1196,16 +1226,16 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
           <span className="text-[10px] font-mono text-muted-foreground w-20 text-center">{currentIndex + 1} / {filteredImages.length}</span>
           <Button size="sm" variant="outline" onClick={() => navigateImage('next')} disabled={currentIndex >= filteredImages.length - 1}><ChevronRight className="w-4 h-4" /></Button>
 
-          {/* Batch job monitor toggle — always visible when jobs exist */}
-          {Object.keys(batchJobs).length > 0 && (
+          {/* Jobs indicator — clicking opens the Jobs sidebar tab */}
+          {totalJobCount > 0 && (
             <>
               <div className="w-px h-6 bg-border" />
               <Button
                 size="sm"
-                variant={mainView === 'batch' ? 'default' : 'outline'}
-                onClick={() => setMainView(v => v === 'batch' ? 'annotate' : 'batch')}
+                variant={sidebarTab === 'jobs' ? 'default' : 'outline'}
+                onClick={() => setSidebarTab('jobs')}
                 className="gap-1.5 text-xs font-mono"
-                title="Batch job monitor"
+                title="View batch jobs"
               >
                 {runningJobCount > 0 && <span className="live-dot text-primary" />}
                 Jobs
@@ -1248,165 +1278,8 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
           </div>
         )}
 
-        {/* ── Batch monitor view ───────────────────────────────────────────── */}
-        {mainView === 'batch' && (
-          <div className="flex-1 flex flex-col overflow-hidden bg-background bg-dot-grid">
-            {/* Header */}
-            <div className="flex items-center gap-3 px-5 py-3 border-b border-border bg-background/80 backdrop-blur shrink-0">
-              <button
-                onClick={() => setMainView('annotate')}
-                className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
-              >
-                <ChevronLeft className="w-3.5 h-3.5" strokeWidth={1.5} /> Back
-              </button>
-              <div className="w-px h-4 bg-border" />
-              <div className="flex-1 flex items-baseline gap-2">
-                <h2 className="font-display font-bold text-sm tracking-tight text-gradient-accent">Batch Jobs</h2>
-                <span className="text-[9px] font-mono text-muted-foreground/50 uppercase tracking-widest">
-                  {Object.keys(batchJobs).length} total
-                </span>
-              </div>
-              <div className="flex items-center gap-3 text-[10px]">
-                {Object.values(batchJobs).filter(j => j.status === 'running').length > 0 && (
-                  <span className="flex items-center gap-1.5 text-primary font-mono">
-                    <span className="live-dot" />
-                    {Object.values(batchJobs).filter(j => j.status === 'running').length} running
-                  </span>
-                )}
-                {Object.values(batchJobs).filter(j => j.status === 'paused').length > 0 && (
-                  <span className="text-warning font-mono">
-                    {Object.values(batchJobs).filter(j => j.status === 'paused').length} paused
-                  </span>
-                )}
-              </div>
-            </div>
-
-            {/* Job cards */}
-            <div className="flex-1 overflow-y-auto p-5 space-y-3">
-              {Object.keys(batchJobs).length === 0 ? (
-                <div className="flex flex-col items-center justify-center h-full gap-3 text-muted-foreground">
-                  <p className="text-[10px] font-mono uppercase tracking-widest opacity-30">no jobs</p>
-                  <p className="text-sm">Start a batch from the right panel</p>
-                </div>
-              ) : (
-                Object.values(batchJobs).slice().reverse().map(job => {
-                  const processed = job.processed ?? (job.annotated + job.failed)
-                  const isActive = job.status === 'running' || job.status === 'paused'
-                  const isRunning = job.status === 'running'
-                  return (
-                    <div key={job.job_id}
-                      className={cn(
-                        'rounded-xl bg-card overflow-hidden animate-card-enter',
-                        isRunning ? 'gradient-border-active' : 'border border-border'
-                      )}>
-
-                      {/* Card header */}
-                      <div className="flex items-start gap-3 px-4 pt-4 pb-3">
-                        <div className="flex-1 min-w-0">
-                          <div className="flex flex-wrap gap-1 mb-2">
-                            {job.text_prompt.split(',').map(t => t.trim()).filter(Boolean).map(tag => (
-                              <span key={tag}
-                                className="px-2 py-px bg-primary/8 text-primary border border-primary/15 rounded-full text-[10px] font-semibold tracking-wide">
-                                {tag}
-                              </span>
-                            ))}
-                          </div>
-                          <p className="text-[9px] text-muted-foreground/50 font-mono tracking-wider">
-                            {job.job_id} · {fmtElapsed(job.started_at)}
-                          </p>
-                        </div>
-
-                        {/* Status badge */}
-                        <span className={cn(
-                          'shrink-0 flex items-center gap-1.5 text-[9px] px-2 py-1 rounded-full font-mono uppercase tracking-widest',
-                          isRunning                  && 'bg-primary/8 text-primary',
-                          job.status === 'paused'    && 'bg-warning/10 text-warning',
-                          job.status === 'done'      && 'bg-success/10 text-success',
-                          job.status === 'error'     && 'bg-destructive/10 text-destructive',
-                          job.status === 'cancelled' && 'bg-muted text-muted-foreground',
-                        )}>
-                          {isRunning && <span className="live-dot" />}
-                          {job.status}
-                        </span>
-                      </div>
-
-                      {/* Progress */}
-                      <div className="px-4 pb-4 space-y-3">
-                        <div className="space-y-1.5">
-                          <div className="flex items-center justify-between text-[9px] font-mono text-muted-foreground/60">
-                            <span>{processed} / {job.total || '?'} images</span>
-                            <span className="text-foreground/70">{job.progress}%</span>
-                          </div>
-                          <div className="relative h-[3px] bg-muted/60 rounded-full overflow-hidden">
-                            <div
-                              className={cn(
-                                'absolute inset-y-0 left-0 rounded-full transition-all duration-700',
-                                job.status === 'done'      ? 'bg-success' :
-                                job.status === 'error'     ? 'bg-destructive' :
-                                job.status === 'cancelled' ? 'bg-muted-foreground' :
-                                job.status === 'paused'    ? 'bg-warning' : 'bg-primary'
-                              )}
-                              style={{ width: `${job.progress}%` }}
-                            >
-                              {isRunning && <span className="shimmer-overlay" />}
-                            </div>
-                          </div>
-                        </div>
-
-                        {/* Stats grid */}
-                        <div className="grid grid-cols-4 gap-1 pt-1 border-t border-border/60">
-                          {[
-                            { label: 'Processed',   value: processed,             color: '' },
-                            { label: 'Annotated',   value: job.annotated,         color: 'text-success' },
-                            { label: 'Labels',      value: job.total_annotations, color: 'text-primary' },
-                            { label: 'Failed',      value: job.failed,            color: job.failed > 0 ? 'text-destructive' : 'text-muted-foreground/40' },
-                          ].map(({ label, value, color }) => (
-                            <div key={label} className="text-center pt-2">
-                              <div className={cn('text-base font-mono font-bold tabular-nums leading-none', color || 'text-foreground')}>
-                                {value ?? '–'}
-                              </div>
-                              <div className="text-[8px] font-mono text-muted-foreground/50 uppercase tracking-widest mt-1.5">{label}</div>
-                            </div>
-                          ))}
-                        </div>
-
-                        {/* Controls */}
-                        {isActive && (
-                          <div className="flex items-center gap-2 pt-1">
-                            {isRunning ? (
-                              <button onClick={() => pauseJob(job.job_id)}
-                                className="flex items-center gap-1.5 text-[10px] font-mono px-3 py-1.5 rounded-md border border-warning/20 bg-warning/5 text-warning hover:bg-warning/10 transition-colors">
-                                <Pause className="w-2.5 h-2.5" strokeWidth={2} /> Pause
-                              </button>
-                            ) : (
-                              <button onClick={() => resumeJob(job.job_id)}
-                                className="flex items-center gap-1.5 text-[10px] font-mono px-3 py-1.5 rounded-md border border-primary/20 bg-primary/5 text-primary hover:bg-primary/10 transition-colors">
-                                <Play className="w-2.5 h-2.5" strokeWidth={2} /> Resume
-                              </button>
-                            )}
-                            <button onClick={() => cancelJob(job.job_id)}
-                              className="flex items-center gap-1.5 text-[10px] font-mono px-3 py-1.5 rounded-md border border-destructive/20 bg-destructive/5 text-destructive hover:bg-destructive/10 transition-colors">
-                              <StopCircle className="w-2.5 h-2.5" strokeWidth={2} /> Cancel
-                            </button>
-                          </div>
-                        )}
-
-                        {job.status === 'error' && job.error && (
-                          <div className="px-3 py-2 rounded-lg bg-destructive/5 border border-destructive/15 text-[10px] font-mono text-destructive">
-                            {job.error}
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  )
-                })
-              )}
-            </div>
-          </div>
-        )}
-
-        {/* ── Annotation canvas view ────────────────────────────────────────── */}
-        {mainView === 'annotate' && <>
+        {/* ── Annotation canvas view ──────────────────────────────────────── */}
+        <>
 
         {/* Canvas */}
         <div ref={containerRef} className="flex-1 overflow-auto bg-muted/30 flex items-center justify-center p-4 relative">
@@ -1507,25 +1380,49 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
             </Button>
           </div>
         </div>
-        </> /* end mainView === 'annotate' */}
+        </>
       </div>
 
       {/* ── Right panel ─────────────────────────────────────────────────── */}
-      <div className="w-60 border-l border-border bg-card flex flex-col shrink-0">
+      <div className="w-64 border-l border-border bg-card flex flex-col shrink-0">
 
-        {/* Panel header */}
-        <div className="px-4 py-3 border-b border-border flex items-center justify-between">
-          <p className="text-[9px] font-mono font-semibold uppercase tracking-[0.18em] text-muted-foreground/60">
-            Auto-Annotate
-          </p>
-          {runningJobCount > 0 && (
-            <button onClick={() => setMainView('batch')}
-              className="flex items-center gap-1.5 text-[9px] font-mono text-primary hover:text-primary/80">
-              <span className="live-dot" />
-              {runningJobCount} live
-            </button>
-          )}
+        {/* Tab switcher */}
+        <div className="flex border-b border-border shrink-0">
+          <button
+            onClick={() => setSidebarTab('annotate')}
+            className={cn(
+              'flex-1 py-2.5 text-[10px] font-mono font-semibold uppercase tracking-wider transition-colors',
+              sidebarTab === 'annotate'
+                ? 'text-primary border-b-2 border-primary bg-primary/5'
+                : 'text-muted-foreground/60 hover:text-foreground'
+            )}
+          >
+            Annotate
+          </button>
+          <button
+            onClick={() => setSidebarTab('jobs')}
+            className={cn(
+              'flex-1 py-2.5 text-[10px] font-mono font-semibold uppercase tracking-wider transition-colors flex items-center justify-center gap-1.5',
+              sidebarTab === 'jobs'
+                ? 'text-primary border-b-2 border-primary bg-primary/5'
+                : 'text-muted-foreground/60 hover:text-foreground'
+            )}
+          >
+            {runningJobCount > 0 && <span className="live-dot" />}
+            Jobs
+            {totalJobCount > 0 && (
+              <span className={cn(
+                'px-1.5 py-px rounded font-mono text-[9px] leading-none',
+                runningJobCount > 0 ? 'bg-primary/15 text-primary' : 'bg-muted text-muted-foreground'
+              )}>
+                {totalJobCount}
+              </span>
+            )}
+          </button>
         </div>
+
+        {/* ── Annotate tab ─────────────────────────────────────────────── */}
+        {sidebarTab === 'annotate' && <>
 
         {/* Model + confidence */}
         <div className="p-3 space-y-3 border-b border-border">
@@ -1590,11 +1487,11 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
                 <p className="text-[9px] font-mono font-semibold uppercase tracking-[0.18em] text-primary/70">
                   {sectionLabel}
                 </p>
-                {Object.keys(batchJobs).length > 0 && (
-                  <button onClick={() => setMainView('batch')}
+                {totalJobCount > 0 && (
+                  <button onClick={() => setSidebarTab('jobs')}
                     className="text-[9px] font-mono text-muted-foreground hover:text-primary flex items-center gap-1.5 transition-colors">
                     {runningJobCount > 0 && <span className="live-dot text-primary" />}
-                    {Object.keys(batchJobs).length} job{Object.keys(batchJobs).length !== 1 ? 's' : ''}
+                    {totalJobCount} job{totalJobCount !== 1 ? 's' : ''}
                   </button>
                 )}
               </div>
@@ -1647,7 +1544,7 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
               <Button size="sm" variant="outline"
                 className="w-full h-7 text-xs gap-1.5 border-border hover:border-primary/40 hover:text-primary"
                 onClick={textAnnotateSingle}
-                disabled={promptTags.length === 0 || isAutoAnnotating || mainView === 'batch'}>
+                disabled={promptTags.length === 0 || isAutoAnnotating}>
                 {isAutoAnnotating
                   ? <Loader2 className="w-3 h-3 animate-spin" />
                   : <Wand2 className="w-3 h-3" strokeWidth={1.5} />
@@ -1732,6 +1629,179 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
             </div>
           )}
         </div>
+
+        </> /* end sidebarTab === 'annotate' */}
+
+        {/* ── Jobs tab ─────────────────────────────────────────────────── */}
+        {sidebarTab === 'jobs' && (
+          <div className="flex-1 overflow-y-auto flex flex-col min-h-0">
+            {totalJobCount === 0 ? (
+              <div className="flex flex-col items-center justify-center flex-1 gap-2 text-muted-foreground p-4">
+                <p className="text-[10px] font-mono uppercase tracking-widest opacity-30">no jobs</p>
+                <p className="text-xs text-center">Start a batch job from the Annotate tab</p>
+                <button
+                  onClick={() => setSidebarTab('annotate')}
+                  className="text-xs text-primary underline underline-offset-2 mt-1"
+                >
+                  Go to Annotate
+                </button>
+              </div>
+            ) : (
+              <div className="p-2 space-y-2">
+                {/* Summary row */}
+                <div className="flex items-center gap-2 px-1 py-1.5 text-[9px] font-mono text-muted-foreground/50">
+                  <span>{totalJobCount} job{totalJobCount !== 1 ? 's' : ''}</span>
+                  {runningJobCount > 0 && (
+                    <span className="flex items-center gap-1 text-primary">
+                      <span className="live-dot" /> {runningJobCount} live
+                    </span>
+                  )}
+                </div>
+                {Object.values(batchJobs).slice().reverse().map(job => {
+                  const processed = job.processed ?? (job.annotated + job.failed)
+                  const isActive = job.status === 'running' || job.status === 'paused'
+                  const isRunning = job.status === 'running'
+                  return (
+                    <div key={job.job_id}
+                      className={cn(
+                        'rounded-xl bg-background overflow-hidden',
+                        isRunning ? 'gradient-border-active' : 'border border-border'
+                      )}>
+
+                      {/* Card header */}
+                      <div className="flex items-start gap-2 px-3 pt-3 pb-2">
+                        <div className="flex-1 min-w-0">
+                          <div className="flex flex-wrap gap-1 mb-1.5">
+                            {job.text_prompt.split(',').map(t => t.trim()).filter(Boolean).map(tag => (
+                              <span key={tag}
+                                className="px-1.5 py-px bg-primary/8 text-primary border border-primary/15 rounded-full text-[9px] font-semibold">
+                                {tag}
+                              </span>
+                            ))}
+                          </div>
+                          <p className="text-[8px] text-muted-foreground/40 font-mono">
+                            {job.job_id} · {fmtElapsed(job.started_at)}
+                          </p>
+                        </div>
+                        <span className={cn(
+                          'shrink-0 flex items-center gap-1 text-[8px] px-1.5 py-0.5 rounded-full font-mono uppercase tracking-wider',
+                          isRunning                      && 'bg-primary/8 text-primary',
+                          job.status === 'paused'        && 'bg-warning/10 text-warning',
+                          job.status === 'done'          && 'bg-success/10 text-success',
+                          job.status === 'error'         && 'bg-destructive/10 text-destructive',
+                          job.status === 'cancelled'     && 'bg-muted text-muted-foreground',
+                          job.status === 'interrupted'   && 'bg-muted text-muted-foreground',
+                        )}>
+                          {isRunning && <span className="live-dot" />}
+                          {job.status}
+                        </span>
+                      </div>
+
+                      {/* Progress */}
+                      <div className="px-3 pb-3 space-y-2">
+                        <div className="space-y-1">
+                          <div className="flex items-center justify-between text-[8px] font-mono text-muted-foreground/50">
+                            <span>{processed} / {job.total || '?'}</span>
+                            <span>{job.progress}%</span>
+                          </div>
+                          <div className="relative h-[3px] bg-muted/60 rounded-full overflow-hidden">
+                            <div
+                              className={cn(
+                                'absolute inset-y-0 left-0 rounded-full transition-all duration-700',
+                                job.status === 'done'        ? 'bg-success' :
+                                job.status === 'error'       ? 'bg-destructive' :
+                                job.status === 'cancelled'   ? 'bg-muted-foreground' :
+                                job.status === 'interrupted' ? 'bg-muted-foreground' :
+                                job.status === 'paused'      ? 'bg-warning' : 'bg-primary'
+                              )}
+                              style={{ width: `${job.progress}%` }}
+                            >
+                              {isRunning && <span className="shimmer-overlay" />}
+                            </div>
+                          </div>
+                        </div>
+
+                        {/* Stats */}
+                        <div className="grid grid-cols-4 gap-0.5 pt-1 border-t border-border/60">
+                          {[
+                            { label: 'Done',    value: processed,             color: '' },
+                            { label: 'Annot',   value: job.annotated,         color: 'text-success' },
+                            { label: 'Labels',  value: job.total_annotations, color: 'text-primary' },
+                            { label: 'Fail',    value: job.failed,            color: job.failed > 0 ? 'text-destructive' : 'text-muted-foreground/30' },
+                          ].map(({ label, value, color }) => (
+                            <div key={label} className="text-center pt-1.5">
+                              <div className={cn('text-xs font-mono font-bold tabular-nums leading-none', color || 'text-foreground')}>
+                                {value ?? '–'}
+                              </div>
+                              <div className="text-[7px] font-mono text-muted-foreground/40 uppercase tracking-widest mt-1">{label}</div>
+                            </div>
+                          ))}
+                        </div>
+
+                        {/* Recent images preview */}
+                        {(job.recent_images?.length ?? 0) > 0 && (
+                          <div className="pt-1 border-t border-border/60">
+                            <p className="text-[8px] font-mono text-muted-foreground/40 uppercase tracking-wider mb-1.5">
+                              Recent · {job.recent_images!.length} annotated
+                            </p>
+                            <div className="flex gap-1 overflow-x-auto pb-1 scrollbar-thin">
+                              {job.recent_images!.slice().reverse().map((img, idx) => (
+                                <div key={idx} className="shrink-0 relative group">
+                                  <img
+                                    src={`${apiUrl}/api/auto-annotate/text-batch/${job.job_id}/preview/${job.recent_images!.length - 1 - idx}`}
+                                    alt={img.filename}
+                                    className="w-14 h-14 object-cover rounded border border-border"
+                                    loading="lazy"
+                                  />
+                                  <div className="absolute bottom-0 left-0 right-0 bg-black/60 text-[7px] text-white font-mono text-center py-0.5 rounded-b opacity-0 group-hover:opacity-100 transition-opacity">
+                                    {img.annotation_count} ann
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+
+                        {/* Controls */}
+                        {isActive && (
+                          <div className="flex items-center gap-1.5 pt-0.5">
+                            {isRunning ? (
+                              <button onClick={() => pauseJob(job.job_id)}
+                                className="flex items-center gap-1 text-[9px] font-mono px-2 py-1 rounded border border-warning/20 bg-warning/5 text-warning hover:bg-warning/10 transition-colors">
+                                <Pause className="w-2 h-2" strokeWidth={2} /> Pause
+                              </button>
+                            ) : (
+                              <button onClick={() => resumeJob(job.job_id)}
+                                className="flex items-center gap-1 text-[9px] font-mono px-2 py-1 rounded border border-primary/20 bg-primary/5 text-primary hover:bg-primary/10 transition-colors">
+                                <Play className="w-2 h-2" strokeWidth={2} /> Resume
+                              </button>
+                            )}
+                            <button onClick={() => cancelJob(job.job_id)}
+                              className="flex items-center gap-1 text-[9px] font-mono px-2 py-1 rounded border border-destructive/20 bg-destructive/5 text-destructive hover:bg-destructive/10 transition-colors">
+                              <StopCircle className="w-2 h-2" strokeWidth={2} /> Cancel
+                            </button>
+                          </div>
+                        )}
+
+                        {job.status === 'error' && job.error && (
+                          <div className="px-2 py-1.5 rounded bg-destructive/5 border border-destructive/15 text-[9px] font-mono text-destructive">
+                            {job.error}
+                          </div>
+                        )}
+                        {job.status === 'interrupted' && (
+                          <div className="px-2 py-1.5 rounded bg-muted border border-border text-[9px] font-mono text-muted-foreground">
+                            Server restarted — job interrupted at {job.progress}%
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+          </div>
+        )}
+
       </div>
 
       {error && (

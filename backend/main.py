@@ -34,6 +34,7 @@ MODELS_DIR = WORKSPACE_DIR / "models"
 EXPORTS_DIR = WORKSPACE_DIR / "exports"
 SNAPSHOTS_DIR = WORKSPACE_DIR / "snapshots"
 TEMP_DIR = WORKSPACE_DIR / "temp"
+JOBS_FILE = WORKSPACE_DIR / "batch_jobs.json"
 
 # Create directories
 for d in [WORKSPACE_DIR, DATASETS_DIR, MODELS_DIR, EXPORTS_DIR, SNAPSHOTS_DIR, TEMP_DIR]:
@@ -242,6 +243,7 @@ async def lifespan(app: FastAPI):
         daemon=True,
     ).start()
     _restore_datasets()
+    _restore_jobs()
     yield
 
 
@@ -1391,6 +1393,37 @@ _text_annotate_jobs: Dict[str, Dict] = {}
 # Per-job threading controls  {job_id: {"pause": Event (set=run, clear=pause), "stop": Event}}
 _job_controls: Dict[str, Dict] = {}
 
+
+def _persist_jobs():
+    """Persist batch job state to disk so it survives server restarts."""
+    try:
+        with open(JOBS_FILE, "w") as f:
+            json.dump(_text_annotate_jobs, f, indent=2, default=str)
+    except Exception:
+        pass
+
+
+def _restore_jobs():
+    """On startup, restore persisted batch jobs from disk.
+    Any jobs that were running or paused are marked 'interrupted' since
+    the background threads are gone after a restart."""
+    if not JOBS_FILE.exists():
+        return
+    try:
+        with open(JOBS_FILE) as f:
+            jobs = json.load(f)
+        count = 0
+        for job_id, job in jobs.items():
+            if job.get("status") in ("running", "paused"):
+                job["status"] = "interrupted"
+                job["paused"] = False
+            _text_annotate_jobs[job_id] = job
+            count += 1
+        if count:
+            print(f"[startup] Restored {count} batch job(s) from disk.")
+    except Exception:
+        pass
+
 @app.post("/api/auto-annotate/{dataset_id}/text-batch")
 async def auto_annotate_text_batch(
     dataset_id: str,
@@ -1415,6 +1448,7 @@ async def auto_annotate_text_batch(
     stop_ev  = _threading.Event()                   # set = stop requested
 
     _text_annotate_jobs[job_id] = {
+        "job_id": job_id,
         "status": "running",
         "paused": False,
         "progress": 0,
@@ -1425,8 +1459,11 @@ async def auto_annotate_text_batch(
         "total_annotations": 0,  # total annotation objects created
         "dataset_id": dataset_id,
         "text_prompt": text_prompt,
+        "started_at": datetime.utcnow().isoformat(),
+        "recent_images": [],     # last 10 processed images for live preview
     }
     _job_controls[job_id] = {"pause": pause_ev, "stop": stop_ev}
+    _persist_jobs()
 
     def _run_batch(job_id: str):
         try:
@@ -1484,20 +1521,39 @@ async def auto_annotate_text_batch(
                         )
                         _text_annotate_jobs[job_id]["annotated"] += 1
                         _text_annotate_jobs[job_id]["total_annotations"] += len(annotations)
-                        # Keep cache fresh so live polling returns new annotations
+                        # Track recent images for live preview in the UI
+                        try:
+                            rel_path = str(image_file.relative_to(dataset_path))
+                        except Exception:
+                            rel_path = image_file.name
+                        recent = _text_annotate_jobs[job_id].get("recent_images", [])
+                        recent.append({
+                            "filename": image_file.name,
+                            "path": rel_path,
+                            "abs_path": str(image_file),
+                            "image_id": image_file.stem,
+                            "annotation_count": len(annotations),
+                        })
+                        _text_annotate_jobs[job_id]["recent_images"] = recent[-10:]
+                        # Keep image list cache fresh so live polling returns new annotations
                         _images_cache.pop(dataset_id, None)
                     except Exception as exc:
                         print(f"[batch:{job_id}] save failed on {image_file.name}: {exc}")
                         _text_annotate_jobs[job_id]["failed"] += 1
                 _text_annotate_jobs[job_id]["processed"] = i + 1
                 _text_annotate_jobs[job_id]["progress"] = int((i + 1) / max(len(image_files), 1) * 100)
+                # Persist state every 5 images
+                if i % 5 == 4:
+                    _persist_jobs()
 
             # Refresh cache
             _images_cache.pop(dataset_id, None)
             _text_annotate_jobs[job_id]["status"] = "done"
+            _persist_jobs()
         except Exception as e:
             _text_annotate_jobs[job_id]["status"] = "error"
             _text_annotate_jobs[job_id]["error"] = str(e)
+            _persist_jobs()
 
     # Auto-load model if not in memory
     if model_id not in model_manager.loaded_models or not model_manager.loaded_models[model_id].get("model"):
@@ -1530,6 +1586,7 @@ async def pause_text_batch(job_id: str):
     _job_controls[job_id]["pause"].clear()   # clear = blocked/paused
     _text_annotate_jobs[job_id]["paused"] = True
     _text_annotate_jobs[job_id]["status"] = "paused"
+    _persist_jobs()
     return {"status": "paused"}
 
 
@@ -1543,21 +1600,46 @@ async def resume_text_batch(job_id: str):
     _text_annotate_jobs[job_id]["paused"] = False
     _text_annotate_jobs[job_id]["status"] = "running"
     _job_controls[job_id]["pause"].set()    # set = unblocked/running
+    _persist_jobs()
     return {"status": "running"}
 
 
 @app.post("/api/auto-annotate/text-batch/{job_id}/cancel")
 async def cancel_text_batch(job_id: str):
     """Cancel a running or paused batch job."""
-    if job_id not in _job_controls:
+    if job_id not in _text_annotate_jobs:
         raise HTTPException(status_code=404, detail="Job not found")
-    if _text_annotate_jobs[job_id]["status"] in ("done", "cancelled", "error"):
+    current_status = _text_annotate_jobs[job_id]["status"]
+    if current_status in ("done", "cancelled", "error"):
         raise HTTPException(status_code=400, detail="Job is already finished")
-    ctrl = _job_controls[job_id]
-    ctrl["stop"].set()
-    ctrl["pause"].set()   # unblock a paused thread so it can see stop_ev
+    # Signal the background thread if it's still alive
+    if job_id in _job_controls:
+        ctrl = _job_controls[job_id]
+        ctrl["stop"].set()
+        ctrl["pause"].set()   # unblock a paused thread so it can see stop_ev
     _text_annotate_jobs[job_id]["status"] = "cancelled"
+    _persist_jobs()
     return {"status": "cancelled"}
+
+
+@app.get("/api/auto-annotate/jobs")
+async def list_batch_jobs():
+    """Return all known batch jobs (for frontend state restoration)."""
+    return {"jobs": list(_text_annotate_jobs.values())}
+
+
+@app.get("/api/auto-annotate/text-batch/{job_id}/preview/{idx}")
+async def get_batch_job_preview_image(job_id: str, idx: int):
+    """Serve a recently-processed image from a batch job for live preview."""
+    if job_id not in _text_annotate_jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    recent = _text_annotate_jobs[job_id].get("recent_images", [])
+    if idx < 0 or idx >= len(recent):
+        raise HTTPException(status_code=404, detail="Image index out of range")
+    abs_path = recent[idx].get("abs_path")
+    if not abs_path or not Path(abs_path).exists():
+        raise HTTPException(status_code=404, detail="Image file not found")
+    return FileResponse(abs_path)
 
 
 # ============== FORMAT CONVERSION ==============
