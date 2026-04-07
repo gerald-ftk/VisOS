@@ -1,0 +1,34 @@
+# Ignore entire project folder
+project/
+
+# --- But keep the structure if needed (optional) ---
+# !project/README.md
+
+# --- Common ignores inside project (redundant since project/ is ignored, but explicit if you later unignore parts) ---
+
+# Logs / build / cache
+project/.logs/
+project/.next/
+project/backend/__pycache__/
+project/backend/venv/
+project/backend/runs/
+project/.claude/
+
+# Workspace heavy data
+project/backend/workspace/
+project/backend/workspace/datasets/
+project/backend/workspace/models/
+project/backend/workspace/exports/
+project/backend/workspace/snapshots/
+project/backend/workspace/temp/
+project/backend/workspace/videos/
+
+
+
+# Node
+project/node_modules/
+
+# Environment / misc
+*.env
+*.log
+.DS_Store
