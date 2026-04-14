@@ -343,11 +343,12 @@ def start_backend(python_bin: Path):
     cmd = [
         str(python_bin), "-m", "uvicorn", "main:app",
         "--reload",
-        # Exclude venv and cache dirs so pip installs don't trigger spurious reloads.
-        # Must be absolute paths — watchfiles DefaultFilter.ignore_paths uses
-        # Path.is_relative_to() which requires absolute prefixes to match correctly.
+        # Exclude the venv so pip installs don't trigger spurious reloads.
+        # Uvicorn's FileFilter compares exclude_dirs against path.parents, which
+        # are absolute, so the exclude must be absolute too. Only pass dirs that
+        # actually exist — uvicorn globs non-existent patterns from cwd, and
+        # Python 3.11's Path.glob() rejects absolute patterns.
         "--reload-exclude", venv_dir,
-        "--reload-exclude", str(BACKEND_DIR / "__pycache__"),
         "--host", "0.0.0.0",
         "--port", "8000",
         "--log-level", "info",
