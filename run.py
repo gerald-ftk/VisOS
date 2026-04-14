@@ -1,15 +1,4 @@
 #!/usr/bin/env python3
-# ── CHANGES vs PREVIOUS VERSION ───────────────────────────────────────────────
-# • Added _tee_stream() helper: reads subprocess stdout line-by-line and writes
-#   each line to BOTH the terminal (with colour prefix) AND the log file.
-# • start_backend() / start_frontend(): changed stdout/stderr from redirecting
-#   directly to a log file → subprocess.PIPE, then spawning a daemon tee thread.
-#   Both now return (proc, tee_thread, stop_event) instead of just proc.
-# • cmd_start(): unpacks the new 3-tuple; signals tee stop_events on Ctrl+C
-#   before calling cmd_stop(), so tee threads exit cleanly.
-# • cmd_restart_backend() / cmd_restart_frontend(): unpack new 3-tuple
-#   (unused tee/stop assigned to _tee, _stop — they stay alive as daemons).
-# ──────────────────────────────────────────────────────────────────────────────
 """
 CV Dataset Manager - Process Manager
 
@@ -32,6 +21,8 @@ import time
 import threading
 import json
 import webbrowser
+import urllib.request
+import urllib.error
 from pathlib import Path
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
@@ -61,6 +52,59 @@ def info(msg):  print(f"  {C}→{W}  {msg}")
 def warn(msg):  print(f"  {Y}!{W}  {msg}")
 def err(msg):   print(f"  {R}✗{W}  {msg}")
 def head(msg):  print(f"\n{BOLD}{C}{msg}{W}")
+
+
+# ── Live spinner ───────────────────────────────────────────────────────────────
+class _Spinner:
+    """Animated terminal spinner with a live-updating status line.
+
+    Usage::
+
+        spinner = _Spinner("Downloading packages…").start()
+        spinner.update("Installing torch…")
+        spinner.stop("Packages installed.")   # clears the line, then prints ✓
+    """
+
+    _FRAMES = ("|", "/", "-", "\\")   # ASCII — safe on every platform/encoding
+
+    def __init__(self, initial_msg: str = ""):
+        self._msg = initial_msg
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(target=self._spin, daemon=True)
+
+    def _spin(self):
+        i = 0
+        while not self._stop_event.is_set():
+            frame = self._FRAMES[i % len(self._FRAMES)]
+            line = f"\r  {C}{frame}{W}  {self._msg}   "
+            try:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+            except Exception:
+                pass
+            time.sleep(0.1)
+            i += 1
+
+    def update(self, msg: str):
+        """Replace the status text shown beside the spinner."""
+        self._msg = msg
+
+    def start(self) -> "_Spinner":
+        self._thread.start()
+        return self
+
+    def stop(self, final_msg: str = ""):
+        """Stop the spinner and optionally print a success line."""
+        self._stop_event.set()
+        self._thread.join(timeout=0.5)
+        # Erase the spinner line completely before printing the final status
+        try:
+            sys.stdout.write(f"\r{' ' * 72}\r")
+            sys.stdout.flush()
+        except Exception:
+            pass
+        if final_msg:
+            ok(final_msg)
 
 
 # ── PID file helpers ───────────────────────────────────────────────────────────
@@ -149,23 +193,112 @@ def _venv_paths():
 
 
 def ensure_backend_deps():
+    """Create venv if missing, then install requirements with a live progress spinner."""
     venv, python_bin, pip_bin = _venv_paths()
+
     if not venv.exists():
-        info("Creating Python virtual environment…")
-        subprocess.run([sys.executable, "-m", "venv", str(venv)], check=True)
-    info("Checking Python packages…")
-    subprocess.run(
-        [str(pip_bin), "install", "-r", "requirements.txt", "-q", "--disable-pip-version-check"],
-        cwd=BACKEND_DIR, check=True
+        spinner = _Spinner("Creating Python virtual environment…").start()
+        result = subprocess.run(
+            [sys.executable, "-m", "venv", str(venv)],
+            capture_output=True,
+        )
+        spinner.stop()
+        if result.returncode != 0:
+            err("Failed to create virtual environment.")
+            sys.stderr.buffer.write(result.stderr)
+            sys.exit(1)
+        ok("Virtual environment created.")
+
+    spinner = _Spinner("Checking Python packages…").start()
+
+    proc = subprocess.Popen(
+        [
+            str(pip_bin), "install", "-r", "requirements.txt",
+            "--disable-pip-version-check", "--progress-bar", "off",
+        ],
+        cwd=BACKEND_DIR,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
     )
+
+    output_lines = []
+    for raw in iter(proc.stdout.readline, ""):
+        line = raw.strip()
+        if not line:
+            continue
+        output_lines.append(line)
+        # Surface the most meaningful pip progress lines as status updates
+        if line.startswith("Collecting "):
+            pkg = line[len("Collecting "):].split()[0]
+            spinner.update(f"Collecting {pkg}…")
+        elif line.startswith("Downloading "):
+            parts = line[len("Downloading "):].split()
+            pkg = parts[0] if parts else "package"
+            spinner.update(f"Downloading {pkg}…")
+        elif line.startswith("Installing collected packages:"):
+            pkgs = line[len("Installing collected packages:"):].strip()
+            # Truncate long lists so the line stays readable
+            display = pkgs if len(pkgs) <= 48 else pkgs[:45] + "…"
+            spinner.update(f"Installing {display}…")
+        elif line.startswith("Successfully installed"):
+            spinner.update("Finalizing…")
+
+    proc.wait()
+    spinner.stop()
+
+    if proc.returncode != 0:
+        err("Failed to install Python dependencies. Last output:")
+        for line in output_lines[-20:]:
+            print(f"    {line}")
+        sys.exit(1)
+
+    ok("Python dependencies ready.")
     return python_bin
 
 
 def ensure_frontend_deps():
-    if not (ROOT / "node_modules").exists():
-        info("Installing Node.js packages (first run — may take a minute)…")
-        pm = "pnpm" if _has("pnpm") else "npm"
-        subprocess.run(f"{pm} install", cwd=ROOT, shell=True, check=True)
+    """Install Node.js dependencies if node_modules is missing, with a live spinner."""
+    if (ROOT / "node_modules").exists():
+        return
+
+    pm = "pnpm" if _has("pnpm") else "npm"
+    spinner = _Spinner(f"Installing Node.js packages ({pm} install)…").start()
+
+    proc = subprocess.Popen(
+        f"{pm} install",
+        cwd=ROOT,
+        shell=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    output_lines = []
+    for raw in iter(proc.stdout.readline, ""):
+        line = raw.strip()
+        if not line:
+            continue
+        output_lines.append(line)
+        # pnpm/npm both emit lines like "added 123 packages" or package names
+        if any(kw in line.lower() for kw in ("added", "packages", "resolved", "fetching")):
+            display = line if len(line) <= 55 else line[:52] + "…"
+            spinner.update(display)
+
+    proc.wait()
+    spinner.stop()
+
+    if proc.returncode != 0:
+        err(f"Failed to install Node.js dependencies ({pm} install). Last output:")
+        for line in output_lines[-20:]:
+            print(f"    {line}")
+        sys.exit(1)
+
+    ok("Node.js dependencies installed.")
 
 
 def _has(cmd: str) -> bool:
@@ -263,9 +396,8 @@ def start_frontend():
     return proc, tee, stop_event
 
 
-def wait_for_backend(timeout=30) -> bool:
-    """Poll /api/health until it responds or timeout."""
-    import urllib.request, urllib.error
+def wait_for_backend(timeout=120) -> bool:
+    """Poll /api/health until it responds or *timeout* seconds elapse."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -276,9 +408,8 @@ def wait_for_backend(timeout=30) -> bool:
     return False
 
 
-def wait_for_frontend(timeout=30) -> bool:
-    """Poll localhost:3000 until it responds or timeout."""
-    import urllib.request, urllib.error
+def wait_for_frontend(timeout=120) -> bool:
+    """Poll localhost:3000 until it responds or *timeout* seconds elapse."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -363,14 +494,9 @@ def cmd_start(open_browser_flag=True):
                 pass
     time.sleep(0.5)
 
-    # Deps
-    info("Checking backend dependencies…")
+    # Deps (each function shows its own spinner + final ok/err line)
     python_bin = ensure_backend_deps()
-    ok("Backend dependencies ready.")
-
-    info("Checking frontend dependencies…")
     ensure_frontend_deps()
-    ok("Frontend dependencies ready.")
 
     # Launch
     info("Launching backend…")
@@ -381,18 +507,22 @@ def cmd_start(open_browser_flag=True):
     # Persist PIDs immediately so Ctrl+C can clean up
     write_pids({"backend": back_proc.pid, "frontend": front_proc.pid})
 
-    # Health-check
-    info("Waiting for backend to become healthy…")
-    if wait_for_backend(120):
+    # Health-check — both servers have up to 120 s to become ready
+    spinner = _Spinner("Waiting for backend to become healthy…").start()
+    backend_up = wait_for_backend(120)
+    spinner.stop()
+    if backend_up:
         ok("Backend is up   →  http://localhost:8000")
     else:
-        warn("Backend did not respond in 30 s — check .logs/backend.log")
+        warn("Backend did not respond within 120 s — check .logs/backend.log")
 
-    info("Waiting for frontend to become ready…")
-    if wait_for_frontend(120):
+    spinner = _Spinner("Waiting for frontend to become ready…").start()
+    frontend_up = wait_for_frontend(120)
+    spinner.stop()
+    if frontend_up:
         ok("Frontend is up  →  http://localhost:3000")
     else:
-        warn("Frontend did not respond in 60 s — check .logs/frontend.log")
+        warn("Frontend did not respond within 120 s — check .logs/frontend.log")
 
     print(f"""
 {G}{BOLD}
@@ -462,11 +592,13 @@ def cmd_restart_backend():
     pids["backend"] = proc.pid
     write_pids(pids)
 
-    info("Waiting for backend to become healthy…")
-    if wait_for_backend(120):
+    spinner = _Spinner("Waiting for backend to become healthy…").start()
+    backend_up = wait_for_backend(120)
+    spinner.stop()
+    if backend_up:
         ok(f"Backend restarted (PID {proc.pid})  →  http://localhost:8000")
     else:
-        warn("Backend did not respond — check .logs/backend.log")
+        warn("Backend did not respond within 120 s — check .logs/backend.log")
     print()
 
 
@@ -482,11 +614,13 @@ def cmd_restart_frontend():
     pids["frontend"] = proc.pid
     write_pids(pids)
 
-    info("Waiting for frontend to become ready…")
-    if wait_for_frontend(120):
+    spinner = _Spinner("Waiting for frontend to become ready…").start()
+    frontend_up = wait_for_frontend(120)
+    spinner.stop()
+    if frontend_up:
         ok(f"Frontend restarted (PID {proc.pid})  →  http://localhost:3000")
     else:
-        warn("Frontend did not respond — check .logs/frontend.log")
+        warn("Frontend did not respond within 120 s — check .logs/frontend.log")
     print()
 
 

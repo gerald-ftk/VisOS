@@ -161,7 +161,7 @@ class AnnotationManager:
                     if all(key in data for key in ["images", "annotations", "categories"]):
                         json_file = jf
                         break
-            except:
+            except Exception:
                 pass
         
         if not json_file:
@@ -251,7 +251,7 @@ class AnnotationManager:
             try:
                 with Image.open(image_file) as img:
                     width, height = img.size
-            except:
+            except Exception:
                 pass
         
         # Create XML
@@ -336,7 +336,7 @@ class AnnotationManager:
             try:
                 with Image.open(image_file) as img:
                     width, height = img.size
-            except:
+            except Exception:
                 pass
         
         # Load existing or create new
@@ -482,7 +482,7 @@ class AnnotationManager:
                     if all(key in data for key in ["images", "annotations", "categories"]):
                         json_file = jf
                         break
-            except:
+            except Exception:
                 pass
         
         if not json_file:
@@ -1237,7 +1237,7 @@ class AnnotationManager:
                         if all(key in data for key in ["images", "annotations", "categories"]):
                             json_file = jf
                             break
-                except:
+                except Exception:
                     pass
             
             if json_file:

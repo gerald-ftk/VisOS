@@ -5,19 +5,23 @@ A comprehensive tool for managing computer vision datasets
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
+import logging
 import os
 import json
 import shutil
+import threading
 import uuid
 import random
 import yaml
 from pathlib import Path
 from datetime import datetime
 from contextlib import asynccontextmanager
+
+logger = logging.getLogger(__name__)
 
 from dataset_parsers import DatasetParser
 from format_converter import FormatConverter
@@ -68,8 +72,8 @@ def _save_dataset_metadata(dataset_id: str, info: dict):
         meta_path.parent.mkdir(parents=True, exist_ok=True)
         with open(meta_path, "w") as f:
             json.dump(info, f, indent=2, default=str)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("Could not save metadata for dataset %s: %s", dataset_id, exc)
 
 
 def _restore_datasets():
@@ -100,8 +104,8 @@ def _restore_datasets():
                 active_datasets[dataset_id] = info
                 _save_dataset_metadata(dataset_id, info)
                 restored += 1
-        except Exception:
-            pass  # Skip corrupt/incomplete datasets silently
+        except Exception as exc:
+            logger.warning("[startup] Skipping dataset %s — could not load: %s", dataset_id, exc)
     if restored:
         print(f"[startup] Restored {restored} dataset(s) from workspace.")
 
@@ -212,8 +216,8 @@ def _ensure_cuda_torch() -> None:
         time.sleep(3)   # Give WatchFiles a moment to react
         os._exit(0)     # Kill worker process; WatchFiles spawns a fresh one with CUDA torch
     else:
-        err = (result.stderr or result.stdout or "unknown error")[-400:]
-        print(f"[GPU] CUDA PyTorch install failed: {err}")
+        install_error = (result.stderr or result.stdout or "unknown error")[-400:]
+        print(f"[GPU] CUDA PyTorch install failed: {install_error}")
         _gpu_status.update({
             "state": "failed",
             "message": f"Auto-install failed. Run manually:\n"
@@ -224,8 +228,6 @@ def _ensure_cuda_torch() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    import threading
-
     # Both checks run in background threads so startup never blocks.
     # _ensure_cuda_torch will call os.execv to restart the whole process once
     # the CUDA wheel finishes installing — that's fine from a daemon thread.
@@ -261,20 +263,13 @@ app = FastAPI(
 # Root route - shows API status
 @app.get("/")
 async def root():
-    """Root endpoint showing API status and instructions"""
+    """Root endpoint — confirms the API is reachable and surfaces discovery links."""
     return {
         "status": "running",
         "name": "CV Dataset Manager API",
         "version": "3.0.0",
-        "message": "Backend is running! Open http://localhost:3000 for the UI.",
         "docs": "/docs",
         "health": "/api/health",
-        "instructions": {
-            "step1": "This is the backend API server",
-            "step2": "The frontend UI runs on port 3000",
-            "step3": "Run 'npm run dev' or 'pnpm dev' in the project root to start the frontend",
-            "step4": "Then open http://localhost:3000 in your browser"
-        }
     }
 
 # CORS middleware for frontend
@@ -481,8 +476,8 @@ async def list_datasets():
                 fresh["id"] = dataset_id
                 active_datasets[dataset_id] = fresh
                 _save_dataset_metadata(dataset_id, fresh)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("Could not refresh stale dataset %s: %s", dataset_id, exc)
     return {"datasets": list(active_datasets.values())}
 
 
@@ -666,9 +661,13 @@ async def extract_classes_to_new_dataset(dataset_id: str, request: ClassExtractR
             format_converter.convert(output_path, converted_path, source_format, request.output_format)
             shutil.rmtree(output_path, ignore_errors=True)
             converted_path.rename(output_path)
-        except Exception as e:
+        except Exception as exc:
             shutil.rmtree(converted_path, ignore_errors=True)
-            # Fall back to source format if conversion fails
+            # Log and fall back to the source format so the user still gets usable output
+            logger.warning(
+                "Format conversion from %s to %s failed (falling back to %s): %s",
+                source_format, request.output_format, source_format, exc,
+            )
             target_format = source_format
 
     # Parse new dataset
@@ -1541,9 +1540,8 @@ async def auto_annotate_text_batch(
     dataset_path = DATASETS_DIR / dataset_id
     job_id = str(uuid.uuid4())[:8]
 
-    import threading as _threading
-    pause_ev = _threading.Event(); pause_ev.set()   # set = running, clear = paused
-    stop_ev  = _threading.Event()                   # set = stop requested
+    pause_ev = threading.Event(); pause_ev.set()   # set = running, clear = paused
+    stop_ev  = threading.Event()                   # set = stop requested
 
     _text_annotate_jobs[job_id] = {
         "job_id": job_id,
@@ -1669,7 +1667,6 @@ async def auto_annotate_text_batch(
     if model_id not in model_manager.loaded_models or not model_manager.loaded_models[model_id].get("model"):
         raise HTTPException(status_code=400, detail="Model not loaded or unavailable")
 
-    import threading
     threading.Thread(target=_run_batch, args=(job_id,), daemon=True).start()
 
     return {"job_id": job_id, "status": "running"}
@@ -1772,9 +1769,8 @@ async def restart_text_batch(job_id: str):
     if model_id not in model_manager.loaded_models or not model_manager.loaded_models[model_id].get("model"):
         raise HTTPException(status_code=400, detail="Model not loaded or unavailable")
 
-    import threading as _threading
-    pause_ev = _threading.Event(); pause_ev.set()
-    stop_ev = _threading.Event()
+    pause_ev = threading.Event(); pause_ev.set()
+    stop_ev = threading.Event()
     _job_controls[job_id] = {"pause": pause_ev, "stop": stop_ev}
     job["status"] = "running"
     job["paused"] = False
@@ -1874,7 +1870,6 @@ async def restart_text_batch(job_id: str):
             _text_annotate_jobs[job_id]["error"] = str(e)
             _persist_jobs()
 
-    import threading
     threading.Thread(target=_continue_batch, args=(job_id,), daemon=True).start()
     return {"status": "running"}
 
@@ -2082,7 +2077,6 @@ async def get_batch_job_annotated_image(job_id: str, image_id: str):
     
     # Encode to JPEG and return
     _, buffer = cv2.imencode('.jpg', img)
-    from fastapi.responses import Response
     return Response(content=buffer.tobytes(), media_type="image/jpeg")
 
 
@@ -2456,7 +2450,6 @@ async def download_training_report(training_id: str):
         "epoch_history": status["epoch_history"],
     }
     content = _json.dumps(report, indent=2)
-    from fastapi.responses import Response
     return Response(
         content=content,
         media_type="application/json",
@@ -3333,7 +3326,6 @@ async def restart_server():
     uvicorn's file-watcher detects the change and reloads automatically
     without dropping the port.  This is zero-downtime for Python changes.
     """
-    import threading
     def _touch():
         import time, pathlib
         time.sleep(0.3)
@@ -3966,7 +3958,6 @@ async def download_snapshot(dataset_id: str, snapshot_id: str):
     if not snap_zip.exists():
         # Fall back to the standard export
         raise HTTPException(status_code=404, detail="Snapshot not found")
-    from fastapi.responses import FileResponse
     return FileResponse(
         path=str(snap_zip),
         media_type="application/zip",
@@ -4032,11 +4023,11 @@ async def delete_snapshot(dataset_id: str, snapshot_id: str):
 @app.post("/api/shutdown")
 async def shutdown_server():
     """Gracefully shut down the backend server"""
-    import threading, os, signal
+    import signal as _signal
     def _kill():
         import time
         time.sleep(0.5)
-        os.kill(os.getpid(), signal.SIGTERM)
+        os.kill(os.getpid(), _signal.SIGTERM)
     threading.Thread(target=_kill, daemon=True).start()
     return {"success": True, "message": "Server shutting down"}
 

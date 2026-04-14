@@ -25,7 +25,7 @@ VisOS wraps all of that in a local UI. No accounts, no uploads, no bill.
 ```bash
 git clone https://github.com/Dan04ggg/VisOS.git
 cd VisOS
-python3 run.py start
+python3 run.py restart
 ```
 
 `run.py` creates a virtualenv, installs all dependencies, starts the FastAPI backend on `:8000` and the Next.js frontend on `:3000`, health-checks both, and opens your browser.

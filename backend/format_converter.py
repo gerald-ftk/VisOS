@@ -155,7 +155,7 @@ class FormatConverter:
                         else:
                             data["classes"] = config["names"]
                     break
-            except:
+            except Exception:
                 pass
         
         # Find images and labels
@@ -175,7 +175,7 @@ class FormatConverter:
                     try:
                         with Image.open(img_file) as img:
                             width, height = img.size
-                    except:
+                    except Exception:
                         width, height = 0, 0
                     
                     image_data = {
@@ -287,7 +287,7 @@ class FormatConverter:
                         })
                     
                     break
-            except:
+            except Exception:
                 pass
         
         return data
@@ -343,7 +343,7 @@ class FormatConverter:
                                 })
                         
                         data["images"].append(image_data)
-            except:
+            except Exception:
                 pass
         
         data["classes"] = sorted(list(class_set))
@@ -399,7 +399,7 @@ class FormatConverter:
                                 })
                             
                             data["images"].append(image_data)
-            except:
+            except Exception:
                 pass
         
         data["classes"] = sorted(list(class_set))
@@ -451,7 +451,7 @@ class FormatConverter:
                                 int(row.get("ymax", 0)) - int(row.get("ymin", 0))
                             ]
                         })
-            except:
+            except Exception:
                 pass
         
         data["classes"] = sorted(list(class_set))
@@ -517,7 +517,7 @@ class FormatConverter:
                         image_data["annotations"].append(annotation)
                     
                     data["images"].append(image_data)
-            except:
+            except Exception:
                 pass
         
         data["classes"] = sorted(list(class_set))

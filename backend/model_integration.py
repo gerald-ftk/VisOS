@@ -1446,7 +1446,7 @@ class ModelManager:
                             else:
                                 classes = config["names"]
                         break
-                except:
+                except Exception:
                     pass
         
         elif format_name == "coco":
@@ -1457,7 +1457,7 @@ class ModelManager:
                         if "categories" in data:
                             classes = [cat["name"] for cat in data["categories"]]
                         break
-                except:
+                except Exception:
                     pass
         
         return classes

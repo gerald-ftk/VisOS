@@ -138,7 +138,7 @@ class DatasetParser:
                     config = yaml.safe_load(f)
                     if "names" in config or "nc" in config:
                         return True
-            except:
+            except Exception:
                 pass
         
         # Check for YOLO txt format annotations
@@ -163,7 +163,7 @@ class DatasetParser:
                             return True
                         except ValueError:
                             return False
-        except:
+        except Exception:
             return False
         return False
     
@@ -177,7 +177,7 @@ class DatasetParser:
                     data = json.load(f)
                     if all(key in data for key in ["images", "annotations", "categories"]):
                         return True
-            except:
+            except Exception:
                 pass
         
         return False
@@ -192,7 +192,7 @@ class DatasetParser:
                 root = tree.getroot()
                 if root.tag == "annotation" and root.find("object") is not None:
                     return True
-            except:
+            except Exception:
                 pass
         
         return False
@@ -207,7 +207,7 @@ class DatasetParser:
                     data = json.load(f)
                     if "shapes" in data and "imagePath" in data:
                         return True
-            except:
+            except Exception:
                 pass
         
         return False
@@ -223,7 +223,7 @@ class DatasetParser:
                     if isinstance(data, list) and len(data) > 0:
                         if "image" in data[0] and "annotations" in data[0]:
                             return True
-            except:
+            except Exception:
                 pass
         
         return False
@@ -268,7 +268,7 @@ class DatasetParser:
                     header = next(reader, None)
                     if header and "filename" in header and "xmin" in header:
                         return True
-            except:
+            except Exception:
                 pass
         
         return False
@@ -324,7 +324,7 @@ class DatasetParser:
                         else:
                             info["classes"] = config["names"]
                     break
-            except:
+            except Exception:
                 pass
         
         # Count images and annotations
@@ -367,7 +367,7 @@ class DatasetParser:
                 try:
                     with open(label) as f:
                         annotations += sum(1 for line in f if line.strip())
-                except:
+                except Exception:
                     pass
         
         info["num_images"] = len(images)
@@ -384,7 +384,7 @@ class DatasetParser:
                             parts = line.split()
                             if len(parts) > 5:
                                 info["task_type"] = "segmentation"
-                    except:
+                    except Exception:
                         pass
                     break
         
@@ -426,7 +426,7 @@ class DatasetParser:
                         if "keypoints" in ann:
                             info["task_type"] = "keypoint"
                     break
-            except:
+            except Exception:
                 pass
         
         return info
@@ -456,7 +456,7 @@ class DatasetParser:
                         name = obj.find("name")
                         if name is not None:
                             classes.add(name.text)
-            except:
+            except Exception:
                 pass
         
         info["classes"] = list(classes)
@@ -485,7 +485,7 @@ class DatasetParser:
                     
                     for shape in data["shapes"]:
                         classes.add(shape.get("label", "unknown"))
-            except:
+            except Exception:
                 pass
         
         info["classes"] = list(classes)
@@ -515,7 +515,7 @@ class DatasetParser:
                             for ann in item.get("annotations", []):
                                 info["num_annotations"] += 1
                                 classes.add(ann.get("label", "unknown"))
-            except:
+            except Exception:
                 pass
         
         info["classes"] = list(classes)
@@ -542,7 +542,7 @@ class DatasetParser:
                         images.add(row.get("filename", ""))
                         info["num_annotations"] += 1
                         classes.add(row.get("class", "unknown"))
-            except:
+            except Exception:
                 pass
         
         info["num_images"] = len(images)
@@ -619,7 +619,7 @@ class DatasetParser:
                         data = json.load(f)
                         info["num_images"] += 1
                         info["num_annotations"] += len(data.get("objects", []))
-                except:
+                except Exception:
                     pass
         
         return info
@@ -847,7 +847,7 @@ class DatasetParser:
                         else:
                             classes = config["names"]
                     break
-            except:
+            except Exception:
                 pass
 
         def _parse_label_file(label_file):
@@ -1011,7 +1011,7 @@ class DatasetParser:
                             "has_annotations": img["id"] in ann_map
                         })
                     break
-            except:
+            except Exception:
                 pass
         
         return images
@@ -1050,7 +1050,7 @@ class DatasetParser:
                             "annotations": annotations,
                             "has_annotations": len(annotations) > 0
                         })
-            except:
+            except Exception:
                 pass
         
         return images
@@ -1082,7 +1082,7 @@ class DatasetParser:
                         "annotations": annotations,
                         "has_annotations": len(annotations) > 0
                     })
-            except:
+            except Exception:
                 pass
         
         return images
@@ -1337,7 +1337,7 @@ class DatasetParser:
                         json.dump(output_data, f, indent=2)
                     
                     break
-            except:
+            except Exception:
                 pass
         
         # Copy images
