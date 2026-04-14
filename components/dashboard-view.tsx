@@ -4,6 +4,7 @@ import { useState, useEffect } from 'react'
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Progress } from '@/components/ui/progress'
+import { Skeleton } from '@/components/ui/skeleton'
 import {
   BarChart3,
   Image as ImageIcon,
@@ -19,6 +20,7 @@ import {
   ArrowLeftRight,
   Cpu,
   PieChart,
+  AlertCircle,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import type { Dataset } from '@/app/page'
@@ -69,24 +71,31 @@ export function DashboardView({
 }: DashboardViewProps) {
   const [stats, setStats] = useState<DatasetStats | null>(null)
   const [isLoading, setIsLoading] = useState(false)
+  const [statsError, setStatsError] = useState<string | null>(null)
 
   useEffect(() => {
     if (selectedDataset) {
+      setStats(null)
+      setStatsError(null)
       loadStats()
     }
   }, [selectedDataset])
 
-  const loadStats = async () => {
+  const loadStats = async (forceRefresh = false) => {
     if (!selectedDataset) return
     setIsLoading(true)
+    setStatsError(null)
     try {
-      const response = await fetch(`${apiUrl}/api/datasets/${selectedDataset.id}/stats`)
+      const url = `${apiUrl}/api/datasets/${selectedDataset.id}/stats${forceRefresh ? '?force_refresh=true' : ''}`
+      const response = await fetch(url)
       if (response.ok) {
         const data = await response.json()
         setStats(data)
+      } else {
+        setStatsError('Failed to load statistics')
       }
     } catch {
-      // silent
+      setStatsError('Could not reach backend')
     } finally {
       setIsLoading(false)
     }
@@ -216,7 +225,7 @@ export function DashboardView({
                   </div>
                   <p className="font-semibold text-sm truncate mb-1">{dataset.name}</p>
                   <p className="text-xs text-muted-foreground">
-                    {dataset.format.toUpperCase()} · {dataset.num_images.toLocaleString()} images · {dataset.classes?.length || 0} classes
+                    {(!dataset.format || dataset.format === 'unknown' || dataset.format === 'generic-images') ? (dataset.format === 'generic-images' ? 'IMAGES' : 'UNKNOWN') : dataset.format.toUpperCase()} · {dataset.num_images.toLocaleString()} images · {dataset.classes?.length || 0} classes
                   </p>
                 </button>
               ))}
@@ -237,11 +246,11 @@ export function DashboardView({
           <p className="text-[10px] font-mono uppercase tracking-[0.2em] text-muted-foreground/50 mb-1">Dashboard</p>
           <h2 className="text-2xl font-display font-bold tracking-tight">{selectedDataset.name}</h2>
           <p className="text-sm text-muted-foreground mt-0.5">
-            {selectedDataset.format.toUpperCase()} · {selectedDataset.task_type} · created {new Date(selectedDataset.created_at).toLocaleDateString()}
+            {(!selectedDataset.format || selectedDataset.format === 'unknown' ? 'Unknown format' : selectedDataset.format === 'generic-images' ? 'Images only' : selectedDataset.format.toUpperCase())} · {selectedDataset.task_type || 'unknown type'} · created {new Date(selectedDataset.created_at).toLocaleDateString()}
           </p>
         </div>
         <div className="flex items-center gap-2 shrink-0">
-          <Button variant="outline" size="sm" onClick={loadStats} disabled={isLoading}>
+          <Button variant="outline" size="sm" onClick={() => loadStats(true)} disabled={isLoading}>
             <RefreshCw className={cn('w-3.5 h-3.5 mr-1.5', isLoading && 'animate-spin')} strokeWidth={1.75} />
             Refresh
           </Button>
@@ -321,28 +330,45 @@ export function DashboardView({
           </CardHeader>
           <CardContent>
             <div className="space-y-3 max-h-[340px] overflow-y-auto pr-1">
-              {sortedClasses.map(([className, count], idx) => {
-                const percentage = totalAnnotations > 0 ? (count / totalAnnotations) * 100 : 0
-                return (
-                  <div key={className}>
+              {isLoading && !stats ? (
+                /* Loading skeleton */
+                Array.from({ length: 4 }).map((_, i) => (
+                  <div key={i}>
                     <div className="flex items-center justify-between mb-1.5">
-                      <span className="text-xs font-medium truncate flex-1 mr-2">{className}</span>
-                      <span className="text-xs text-muted-foreground tabular-nums shrink-0">
-                        {count.toLocaleString()} <span className="text-muted-foreground/50">({percentage.toFixed(1)}%)</span>
-                      </span>
+                      <Skeleton className="h-3 w-24 rounded" />
+                      <Skeleton className="h-3 w-16 rounded" />
                     </div>
-                    <div className="h-1.5 bg-secondary rounded-full overflow-hidden">
-                      <div
-                        className={cn('h-full rounded-full transition-all', CLASS_COLORS[idx % CLASS_COLORS.length])}
-                        style={{ width: `${percentage}%` }}
-                      />
-                    </div>
+                    <Skeleton className="h-1.5 w-full rounded-full" />
                   </div>
-                )
-              })}
-              {sortedClasses.length === 0 && (
+                ))
+              ) : statsError ? (
+                <div className="flex flex-col items-center gap-2 py-6 text-center">
+                  <AlertCircle className="w-4 h-4 text-destructive" />
+                  <p className="text-xs text-muted-foreground">{statsError}</p>
+                </div>
+              ) : sortedClasses.length > 0 ? (
+                sortedClasses.map(([className, count], idx) => {
+                  const percentage = totalAnnotations > 0 ? (count / totalAnnotations) * 100 : 0
+                  return (
+                    <div key={className}>
+                      <div className="flex items-center justify-between mb-1.5">
+                        <span className="text-xs font-medium truncate flex-1 mr-2">{className}</span>
+                        <span className="text-xs text-muted-foreground tabular-nums shrink-0">
+                          {count.toLocaleString()} <span className="text-muted-foreground/50">({percentage.toFixed(1)}%)</span>
+                        </span>
+                      </div>
+                      <div className="h-1.5 bg-secondary rounded-full overflow-hidden">
+                        <div
+                          className={cn('h-full rounded-full transition-all', CLASS_COLORS[idx % CLASS_COLORS.length])}
+                          style={{ width: `${percentage}%` }}
+                        />
+                      </div>
+                    </div>
+                  )
+                })
+              ) : (
                 <p className="text-xs text-muted-foreground text-center py-6">
-                  No class data yet — annotate some images to see this chart
+                  No class data available for this dataset
                 </p>
               )}
             </div>
@@ -361,7 +387,25 @@ export function DashboardView({
             </CardDescription>
           </CardHeader>
           <CardContent>
-            {stats?.splits && Object.keys(stats.splits).length > 0 ? (
+            {isLoading && !stats ? (
+              /* Loading skeleton */
+              <div className="space-y-4">
+                {Array.from({ length: 3 }).map((_, i) => (
+                  <div key={i}>
+                    <div className="flex items-center justify-between mb-1.5">
+                      <Skeleton className="h-3 w-12 rounded" />
+                      <Skeleton className="h-3 w-20 rounded" />
+                    </div>
+                    <Skeleton className="h-2 w-full rounded-full" />
+                  </div>
+                ))}
+              </div>
+            ) : statsError ? (
+              <div className="flex flex-col items-center gap-2 py-6 text-center">
+                <AlertCircle className="w-4 h-4 text-destructive" />
+                <p className="text-xs text-muted-foreground">{statsError}</p>
+              </div>
+            ) : stats?.splits && Object.keys(stats.splits).length > 0 ? (
               <div className="space-y-4">
                 {Object.entries(stats.splits).map(([split, count]) => {
                   const totalImgs = stats?.total_images || selectedDataset.num_images || 1
@@ -408,8 +452,8 @@ export function DashboardView({
         <CardContent>
           <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-5">
             {[
-              { label: 'Format', value: selectedDataset.format.toUpperCase() },
-              { label: 'Task Type', value: (stats?.task_type || selectedDataset.task_type) },
+              { label: 'Format', value: (!selectedDataset.format || selectedDataset.format === 'unknown' ? 'Unknown' : selectedDataset.format === 'generic-images' ? 'Images (no annotations)' : selectedDataset.format.toUpperCase()) },
+              { label: 'Task Type', value: (stats?.task_type || selectedDataset.task_type || 'Unknown') },
               { label: 'Created', value: new Date(selectedDataset.created_at).toLocaleDateString() },
               { label: 'Dataset ID', value: `${selectedDataset.id.slice(0, 12)}…`, mono: true },
             ].map(({ label, value, mono }) => (

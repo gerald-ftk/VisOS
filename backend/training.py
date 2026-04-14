@@ -316,11 +316,17 @@ class TrainingManager:
                 # RT-DETR from ultralytics is trained via the YOLO class
                 self._train_yolo(job)
             else:
+                # "yolo" — may need seg→bbox conversion if dataset has polygon labels
                 self._train_yolo(job)
         except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
             job["status"] = "failed"
             job["error"]  = str(e)
             job["logs"].append(f"Fatal error: {e}")
+            # Log only the last part of traceback to keep logs readable
+            short_tb = "\n".join(tb.strip().splitlines()[-8:])
+            job["logs"].append(short_tb)
 
     # ── RF-DETR ───────────────────────────────────────────────────────────────
 
@@ -328,9 +334,13 @@ class TrainingManager:
         import subprocess
         try:
             import rfdetr as _rfdetr_pkg  # noqa: F401
-        except ImportError:
-            job["logs"].append("Installing rfdetr…")
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "rfdetr", "-q"])
+            # Also ensure train/loggers extras are available
+            from rfdetr.detr import RFDETRBase as _  # triggers extras check
+        except (ImportError, Exception):
+            job["logs"].append("Installing rfdetr[train,loggers]…")
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", 'rfdetr[train,loggers]', "-q"]
+            )
 
         from rfdetr import RFDETRBase, RFDETRLarge
 
@@ -475,6 +485,202 @@ class TrainingManager:
         job["logs"].append(job["error"])
         return None
 
+    # ── Segmentation label helpers ────────────────────────────────────────────
+
+    @staticmethod
+    def _get_label_dir(img_dir: Path) -> Optional[Path]:
+        """Return the label directory that corresponds to an images directory."""
+        for candidate in [
+            img_dir.parent.parent / "labels" / img_dir.name,
+            Path(str(img_dir).replace(f"{Path.sep}images{Path.sep}", f"{Path.sep}labels{Path.sep}")),
+            Path(str(img_dir).replace("/images/", "/labels/")),
+        ]:
+            if candidate.exists() and candidate.is_dir():
+                return candidate
+        return None
+
+    @staticmethod
+    def _validate_seg_labels(data_yaml: Path, job: Dict) -> None:
+        """Scan YOLO segmentation label files and remove lines that lack valid polygon
+        coordinates (< 7 tokens). These cause DataLoader IndexErrors inside ultralytics."""
+        try:
+            import yaml as _yaml
+            with open(data_yaml) as f:
+                cfg = _yaml.safe_load(f)
+        except Exception as e:
+            job["logs"].append(f"[Validate] Cannot read {data_yaml}: {e}")
+            return
+
+        base = data_yaml.parent
+        total_fixed = 0
+        total_checked = 0
+
+        for split_key in ("train", "val", "test"):
+            split_val = cfg.get(split_key)
+            if not split_val:
+                continue
+            img_dir = Path(split_val) if Path(split_val).is_absolute() else base / split_val
+            if not img_dir.exists():
+                continue
+            lbl_dir = TrainingManager._get_label_dir(img_dir)
+            if not lbl_dir:
+                continue
+
+            for lbl_file in lbl_dir.glob("*.txt"):
+                total_checked += 1
+                try:
+                    raw = lbl_file.read_text(encoding="utf-8", errors="replace").strip()
+                    if not raw:
+                        continue  # empty = background image, OK
+                    good, bad = [], 0
+                    for line in raw.splitlines():
+                        parts = line.strip().split()
+                        if not parts:
+                            continue
+                        if len(parts) == 5:
+                            good.append(line)   # bbox line — keep
+                        elif len(parts) >= 7:
+                            good.append(line)   # valid polygon — keep
+                        else:
+                            bad += 1            # truncated polygon — drop
+                    if bad:
+                        lbl_file.write_text("\n".join(good) + ("\n" if good else ""))
+                        total_fixed += bad
+                except Exception as ex:
+                    job["logs"].append(f"[Validate] {lbl_file.name}: {ex}")
+
+        if total_fixed:
+            job["logs"].append(
+                f"[Validate] Removed {total_fixed} malformed polygon lines from {total_checked} files "
+                f"(would have caused DataLoader IndexError)"
+            )
+        else:
+            job["logs"].append(f"[Validate] Labels OK — {total_checked} label files checked")
+
+    @staticmethod
+    def _labels_are_segmentation(data_yaml: Path) -> bool:
+        """Return True if the dataset labels appear to contain polygon (segmentation) annotations."""
+        try:
+            import yaml as _yaml
+            with open(data_yaml) as f:
+                cfg = _yaml.safe_load(f)
+            base = data_yaml.parent
+            train_val = cfg.get("train") or cfg.get("val")
+            if not train_val:
+                return False
+            img_dir = Path(train_val) if Path(train_val).is_absolute() else base / train_val
+            lbl_dir = TrainingManager._get_label_dir(img_dir)
+            if not lbl_dir:
+                return False
+            # Sample up to 20 label files
+            for lbl_file in list(lbl_dir.glob("*.txt"))[:20]:
+                content = lbl_file.read_text(encoding="utf-8", errors="replace").strip()
+                if content:
+                    first_line = content.splitlines()[0].split()
+                    if len(first_line) > 5:
+                        return True  # polygon format
+            return False
+        except Exception:
+            return False
+
+    @staticmethod
+    def _convert_seg_to_bbox_yaml(data_yaml: Path, job: Dict) -> Optional[Path]:
+        """Create a new data.yaml whose labels are bounding boxes derived from the
+        segmentation polygons. Images are hard-linked (or copied) into a temp directory
+        so that YOLO's images→labels path derivation still works.
+        Returns the new data.yaml path, or None on failure."""
+        import os, shutil
+        try:
+            import yaml as _yaml
+            with open(data_yaml) as f:
+                cfg = _yaml.safe_load(f)
+        except Exception as e:
+            job["logs"].append(f"[Seg→BBox] Cannot read data.yaml: {e}")
+            return None
+
+        base = data_yaml.parent
+        out_dir = base / "_det_from_seg"
+        out_dir.mkdir(exist_ok=True)
+        new_cfg = dict(cfg)
+
+        for split_key in ("train", "val", "test"):
+            split_val = cfg.get(split_key)
+            if not split_val:
+                continue
+            img_dir = Path(split_val) if Path(split_val).is_absolute() else base / split_val
+            if not img_dir.exists():
+                continue
+            lbl_dir = TrainingManager._get_label_dir(img_dir)
+            if not lbl_dir:
+                job["logs"].append(f"[Seg→BBox] No label dir found for {img_dir}, skipping {split_key}")
+                continue
+
+            new_img_dir = out_dir / "images" / split_key
+            new_lbl_dir = out_dir / "labels" / split_key
+            new_img_dir.mkdir(parents=True, exist_ok=True)
+            new_lbl_dir.mkdir(parents=True, exist_ok=True)
+
+            # Hard-link (or copy) image files so YOLO can find them
+            IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"}
+            for img_file in img_dir.iterdir():
+                if img_file.suffix.lower() not in IMG_EXTS:
+                    continue
+                dest = new_img_dir / img_file.name
+                if not dest.exists():
+                    try:
+                        os.link(img_file, dest)
+                    except (OSError, NotImplementedError, AttributeError):
+                        shutil.copy2(img_file, dest)
+
+            # Convert labels: polygon → bbox
+            converted = 0
+            for lbl_file in lbl_dir.glob("*.txt"):
+                try:
+                    content = lbl_file.read_text(encoding="utf-8", errors="replace").strip()
+                    new_lines: List[str] = []
+                    for line in content.splitlines():
+                        parts = line.strip().split()
+                        if not parts:
+                            continue
+                        if len(parts) == 5:
+                            new_lines.append(line)   # already bbox
+                        elif len(parts) >= 7:
+                            class_id = parts[0]
+                            coords = list(map(float, parts[1:]))
+                            xs = coords[0::2]
+                            ys = coords[1::2]
+                            x_min, x_max = min(xs), max(xs)
+                            y_min, y_max = min(ys), max(ys)
+                            cx = (x_min + x_max) / 2
+                            cy = (y_min + y_max) / 2
+                            w = x_max - x_min
+                            h = y_max - y_min
+                            new_lines.append(
+                                f"{class_id} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}"
+                            )
+                            converted += 1
+                    (new_lbl_dir / lbl_file.name).write_text(
+                        "\n".join(new_lines) + ("\n" if new_lines else "")
+                    )
+                except Exception as ex:
+                    job["logs"].append(f"[Seg→BBox] {lbl_file.name}: {ex}")
+
+            new_cfg[split_key] = str(new_img_dir)
+            job["logs"].append(
+                f"[Seg→BBox] {split_key}: converted {converted} polygons → bboxes"
+            )
+
+        new_yaml = out_dir / "data.yaml"
+        try:
+            import yaml as _yaml
+            with open(new_yaml, "w") as f:
+                _yaml.dump(new_cfg, f, default_flow_style=False)
+            job["logs"].append(f"[Seg→BBox] Detection data.yaml → {new_yaml}")
+            return new_yaml
+        except Exception as e:
+            job["logs"].append(f"[Seg→BBox] Failed to write data.yaml: {e}")
+            return None
+
     # ── YOLO detection ────────────────────────────────────────────────────────
 
     def _train_yolo(self, job: Dict):
@@ -493,6 +699,20 @@ class TrainingManager:
         data_yaml = self._find_yaml(dataset_path, job)
         if not data_yaml:
             return
+
+        # Auto-convert segmentation dataset to detection bbox format
+        if self._labels_are_segmentation(data_yaml):
+            job["logs"].append(
+                "Dataset has segmentation (polygon) labels — auto-converting to "
+                "bounding boxes for detection training."
+            )
+            converted_yaml = self._convert_seg_to_bbox_yaml(data_yaml, job)
+            if converted_yaml:
+                data_yaml = converted_yaml
+            else:
+                job["logs"].append(
+                    "Seg→BBox conversion failed; attempting to train with original labels."
+                )
 
         device = _resolve_device(config, job)
 
@@ -535,16 +755,25 @@ class TrainingManager:
                 amp=config.get("amp", True),
                 dropout=config.get("dropout", 0.0),
             )
+            best_pt = output_dir / "train" / "weights" / "best.pt"
+            last_pt = output_dir / "train" / "weights" / "last.pt"
+            job["model_path"] = str(best_pt if best_pt.exists() else last_pt)
             job["status"]     = "completed"
             job["progress"]   = 100
-            job["model_path"] = str(output_dir / "train" / "weights" / "best.pt")
             job["logs"].append("✓ Detection training complete")
+            job["logs"].append(f"Weights: {job['model_path']}")
             if hasattr(results, "results_dict"):
                 job["metrics"].update(results.results_dict)
         except Exception as e:
             job["status"] = "failed"
             job["error"]  = str(e)
             job["logs"].append(f"Training error: {e}")
+            for pt_name in ("best.pt", "last.pt"):
+                pt = output_dir / "train" / "weights" / pt_name
+                if pt.exists():
+                    job["model_path"] = str(pt)
+                    job["logs"].append(f"Partial weights available: {pt}")
+                    break
 
     # ── Segmentation ──────────────────────────────────────────────────────────
 
@@ -563,6 +792,10 @@ class TrainingManager:
         data_yaml = self._find_yaml(dataset_path, job)
         if not data_yaml:
             return
+
+        # Validate and fix segmentation labels before training to prevent DataLoader IndexErrors
+        job["logs"].append("Validating segmentation labels…")
+        self._validate_seg_labels(data_yaml, job)
 
         device = _resolve_device(config, job)
 
@@ -592,17 +825,37 @@ class TrainingManager:
                 lrf=config.get("lrf", 0.01),
                 optimizer=config.get("optimizer", "SGD"),
                 patience=config.get("patience", 50),
+                cos_lr=config.get("cos_lr", False),
+                warmup_epochs=config.get("warmup_epochs", 3),
                 weight_decay=config.get("weight_decay", 0.0005),
+                mosaic=config.get("mosaic", 1.0),
+                hsv_h=config.get("hsv_h", 0.015),
+                hsv_s=config.get("hsv_s", 0.7),
+                hsv_v=config.get("hsv_v", 0.4),
+                flipud=config.get("flipud", 0.0),
+                fliplr=config.get("fliplr", 0.5),
                 amp=config.get("amp", True),
+                dropout=config.get("dropout", 0.0),
             )
+            # Use last.pt if best.pt wasn't saved (e.g. early stop)
+            best_pt = output_dir / "train" / "weights" / "best.pt"
+            last_pt = output_dir / "train" / "weights" / "last.pt"
+            job["model_path"] = str(best_pt if best_pt.exists() else last_pt)
             job["status"]     = "completed"
             job["progress"]   = 100
-            job["model_path"] = str(output_dir / "train" / "weights" / "best.pt")
             job["logs"].append("✓ Segmentation training complete")
+            job["logs"].append(f"Weights: {job['model_path']}")
         except Exception as e:
             job["status"] = "failed"
             job["error"]  = str(e)
             job["logs"].append(f"Training error: {e}")
+            # Still expose any partial weights
+            for pt_name in ("best.pt", "last.pt"):
+                pt = output_dir / "train" / "weights" / pt_name
+                if pt.exists():
+                    job["model_path"] = str(pt)
+                    job["logs"].append(f"Partial weights available: {pt}")
+                    break
 
     # ── Classification ────────────────────────────────────────────────────────
 

@@ -25,7 +25,8 @@ class DatasetMerger:
         self,
         datasets: List[Dict[str, Any]],
         output_path: Path,
-        output_format: str
+        output_format: str,
+        class_mapping: Optional[Dict[str, str]] = None
     ):
         """Merge multiple datasets into one"""
         output_path = Path(output_path)

@@ -508,6 +508,708 @@ class AnnotationManager:
         with open(json_file, "w") as f:
             json.dump(coco_data, f, indent=2)
     
+    # ─────────────────────── CLASS MANAGEMENT ───────────────────────
+
+    YOLO_FORMATS = {
+        "yolo", "yolov5", "yolov8", "yolov9", "yolov10",
+        "yolov11", "yolov12", "yolo_seg", "yolo-seg",
+    }
+
+    def _load_yolo_meta(self, root: Path):
+        """Return (all_classes, yaml_file, yaml_config) for a YOLO root."""
+        for yf in list(root.glob("*.yaml")) + list(root.glob("*.yml")):
+            try:
+                with open(yf) as f:
+                    config = yaml.safe_load(f) or {}
+                if "names" in config:
+                    names = config["names"]
+                    classes = list(names.values()) if isinstance(names, dict) else list(names)
+                    return classes, yf, config
+            except Exception:
+                pass
+        return [], None, {}
+
+    def _save_yolo_meta(self, yaml_file: Path, config: dict, classes: List[str]):
+        config = dict(config)
+        config.pop("path", None)
+        config["nc"] = len(classes)
+        config["names"] = {i: n for i, n in enumerate(classes)}
+        with open(yaml_file, "w") as f:
+            yaml.dump(config, f, default_flow_style=False)
+
+    def _find_yolo_label_files(self, root: Path) -> List[Path]:
+        """Return all YOLO label .txt files under root."""
+        found = []
+        for lbl_dir in root.glob("**/labels"):
+            if lbl_dir.is_dir():
+                found.extend(lbl_dir.glob("*.txt"))
+        if not found:
+            # Flat layout: check every .txt
+            for txt in root.glob("**/*.txt"):
+                if txt.stat().st_size == 0:
+                    found.append(txt)
+                    continue
+                try:
+                    with open(txt) as f:
+                        line = f.readline().strip()
+                    if not line:
+                        found.append(txt)
+                        continue
+                    parts = line.split()
+                    int(parts[0])
+                    float(parts[1])
+                    found.append(txt)
+                except Exception:
+                    pass
+        return found
+
+    def _find_coco_json(self, root: Path) -> Optional[Path]:
+        for jf in list(root.glob("*.json")) + list(root.glob("annotations/*.json")):
+            try:
+                with open(jf) as f:
+                    data = json.load(f)
+                if all(k in data for k in ("images", "annotations", "categories")):
+                    return jf
+            except Exception:
+                pass
+        return None
+
+    # ── extract ──────────────────────────────────────────────────────
+
+    def extract_classes(
+        self,
+        dataset_path: Path,
+        output_path: Path,
+        format_name: str,
+        classes_to_extract: List[str],
+    ) -> Dict[str, Any]:
+        """Extract specific classes to a new dataset (only images that have those classes)."""
+        dataset_path = Path(dataset_path)
+        output_path = Path(output_path)
+        output_path.mkdir(parents=True, exist_ok=True)
+        fmt = format_name.lower()
+        if fmt in self.YOLO_FORMATS:
+            return self._extract_yolo_classes(dataset_path, output_path, classes_to_extract)
+        elif fmt == "coco":
+            return self._extract_coco_classes(dataset_path, output_path, classes_to_extract)
+        elif fmt in ("pascal-voc", "voc"):
+            return self._extract_voc_classes(dataset_path, output_path, classes_to_extract)
+        elif fmt == "labelme":
+            return self._extract_labelme_classes(dataset_path, output_path, classes_to_extract)
+        return {"extracted_images": 0, "extracted_annotations": 0}
+
+    def _extract_yolo_classes(self, dataset_path: Path, output_path: Path, classes_to_extract: List[str]) -> Dict[str, Any]:
+        root = self._find_dataset_root(dataset_path)
+        all_classes, yaml_file, yaml_config = self._load_yolo_meta(root)
+
+        class_to_id = {n: i for i, n in enumerate(all_classes)}
+        valid = [c for c in classes_to_extract if c in class_to_id]
+        target_ids = {class_to_id[c] for c in valid}
+        new_class_to_id = {n: i for i, n in enumerate(valid)}
+        old_to_new = {class_to_id[n]: new_class_to_id[n] for n in valid}
+
+        extracted_images = extracted_annotations = 0
+
+        for img_file in root.glob("**/*"):
+            if img_file.suffix.lower() not in self.IMAGE_EXTENSIONS:
+                continue
+            stem = img_file.stem
+            parent = img_file.parent
+            if parent.name == "images":
+                lbl_file = parent.parent / "labels" / f"{stem}.txt"
+            else:
+                lbl_file = parent.parent / "labels" / f"{stem}.txt"
+            if not lbl_file.exists():
+                lbl_file = parent / f"{stem}.txt"
+            if not lbl_file.exists():
+                continue
+
+            filtered = []
+            try:
+                with open(lbl_file) as f:
+                    for line in f:
+                        parts = line.strip().split()
+                        if not parts:
+                            continue
+                        try:
+                            cid = int(parts[0])
+                        except ValueError:
+                            continue
+                        if cid in target_ids:
+                            filtered.append(f"{old_to_new[cid]} " + " ".join(parts[1:]))
+            except Exception:
+                continue
+
+            if not filtered:
+                continue
+
+            try:
+                img_rel = img_file.relative_to(root)
+            except ValueError:
+                img_rel = Path("images") / img_file.name
+            try:
+                lbl_rel = lbl_file.relative_to(root)
+            except ValueError:
+                lbl_rel = Path("labels") / lbl_file.name
+
+            out_img = output_path / img_rel
+            out_img.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(img_file, out_img)
+
+            out_lbl = output_path / lbl_rel
+            out_lbl.parent.mkdir(parents=True, exist_ok=True)
+            with open(out_lbl, "w") as f:
+                f.write("\n".join(filtered) + "\n")
+
+            extracted_images += 1
+            extracted_annotations += len(filtered)
+
+        # Write YAML
+        new_config = dict(yaml_config)
+        new_config.pop("path", None)
+        new_config["nc"] = len(valid)
+        new_config["names"] = {i: n for i, n in enumerate(valid)}
+        with open(output_path / "data.yaml", "w") as f:
+            yaml.dump(new_config, f, default_flow_style=False)
+
+        return {"extracted_images": extracted_images, "extracted_annotations": extracted_annotations}
+
+    def _extract_coco_classes(self, dataset_path: Path, output_path: Path, classes_to_extract: List[str]) -> Dict[str, Any]:
+        root = self._find_dataset_root(dataset_path)
+        jf = self._find_coco_json(root)
+        if not jf:
+            return {"extracted_images": 0, "extracted_annotations": 0}
+        with open(jf) as f:
+            data = json.load(f)
+
+        extract_set = set(classes_to_extract)
+        sel_cat_ids = {c["id"] for c in data["categories"] if c["name"] in extract_set}
+        filtered_anns = [a for a in data["annotations"] if a["category_id"] in sel_cat_ids]
+        img_ids = {a["image_id"] for a in filtered_anns}
+        filtered_imgs = [i for i in data["images"] if i["id"] in img_ids]
+        filtered_cats = [c for c in data["categories"] if c["name"] in extract_set]
+
+        new_data = {k: data[k] for k in ("info", "licenses") if k in data}
+        new_data.update({"images": filtered_imgs, "annotations": filtered_anns, "categories": filtered_cats})
+
+        rel = jf.relative_to(root)
+        out_jf = output_path / rel
+        out_jf.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_jf, "w") as f:
+            json.dump(new_data, f, indent=2)
+
+        extracted = 0
+        for img_info in filtered_imgs:
+            fname = Path(img_info.get("file_name", "")).name
+            for candidate in root.glob(f"**/{fname}"):
+                try:
+                    out = output_path / candidate.relative_to(root)
+                    out.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(candidate, out)
+                    extracted += 1
+                    break
+                except Exception:
+                    pass
+
+        return {"extracted_images": extracted, "extracted_annotations": len(filtered_anns)}
+
+    def _extract_voc_classes(self, dataset_path: Path, output_path: Path, classes_to_extract: List[str]) -> Dict[str, Any]:
+        root = self._find_dataset_root(dataset_path)
+        extract_set = set(classes_to_extract)
+        ann_dir = root / "Annotations"
+        if not ann_dir.exists():
+            ann_dir = root
+
+        img_dirs = [root / "JPEGImages", root / "images", root]
+
+        extracted_images = extracted_annotations = 0
+
+        for xf in list(ann_dir.glob("*.xml")) + ([] if ann_dir == root else list(root.glob("**/*.xml"))):
+            try:
+                tree = ET.parse(xf)
+                re_ = tree.getroot()
+            except Exception:
+                continue
+
+            matching = [o for o in re_.findall("object")
+                        if o.find("name") is not None and o.find("name").text in extract_set]
+            if not matching:
+                continue
+
+            for obj in list(re_.findall("object")):
+                name_el = obj.find("name")
+                if name_el is None or name_el.text not in extract_set:
+                    re_.remove(obj)
+
+            fn_el = re_.find("filename")
+            fname = fn_el.text if fn_el is not None else xf.stem
+            img_file = None
+            for d in img_dirs:
+                for ext in self.IMAGE_EXTENSIONS:
+                    c = d / f"{Path(fname).stem}{ext}"
+                    if c.exists():
+                        img_file = c
+                        break
+                if img_file:
+                    break
+
+            out_ann = output_path / "Annotations"
+            out_ann.mkdir(parents=True, exist_ok=True)
+            xml_str = minidom.parseString(ET.tostring(re_)).toprettyxml(indent="  ")
+            with open(out_ann / xf.name, "w") as f:
+                f.write(xml_str)
+
+            if img_file:
+                out_img = output_path / "JPEGImages"
+                out_img.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(img_file, out_img / img_file.name)
+
+            extracted_images += 1
+            extracted_annotations += len(matching)
+
+        return {"extracted_images": extracted_images, "extracted_annotations": extracted_annotations}
+
+    def _extract_labelme_classes(self, dataset_path: Path, output_path: Path, classes_to_extract: List[str]) -> Dict[str, Any]:
+        root = self._find_dataset_root(dataset_path)
+        extract_set = set(classes_to_extract)
+        extracted_images = extracted_annotations = 0
+
+        for jf in root.glob("**/*.json"):
+            try:
+                with open(jf) as f:
+                    data = json.load(f)
+                if "shapes" not in data:
+                    continue
+            except Exception:
+                continue
+
+            matching = [s for s in data["shapes"] if s.get("label") in extract_set]
+            if not matching:
+                continue
+
+            data["shapes"] = matching
+            try:
+                rel = jf.relative_to(root)
+            except ValueError:
+                rel = Path(jf.name)
+            out_jf = output_path / rel
+            out_jf.parent.mkdir(parents=True, exist_ok=True)
+            with open(out_jf, "w") as f:
+                json.dump(data, f, indent=2)
+
+            img_path = data.get("imagePath", "")
+            img_file = None
+            if img_path:
+                c = jf.parent / img_path
+                if c.exists():
+                    img_file = c
+            if not img_file:
+                for ext in self.IMAGE_EXTENSIONS:
+                    c = jf.parent / f"{jf.stem}{ext}"
+                    if c.exists():
+                        img_file = c
+                        break
+            if img_file:
+                try:
+                    out_img = output_path / img_file.relative_to(root)
+                    out_img.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(img_file, out_img)
+                except Exception:
+                    pass
+
+            extracted_images += 1
+            extracted_annotations += len(matching)
+
+        return {"extracted_images": extracted_images, "extracted_annotations": extracted_annotations}
+
+    # ── delete ───────────────────────────────────────────────────────
+
+    def delete_classes(
+        self,
+        dataset_path: Path,
+        format_name: str,
+        classes_to_delete: List[str],
+    ) -> Dict[str, Any]:
+        """Remove all annotations for the given classes from the dataset."""
+        dataset_path = Path(dataset_path)
+        fmt = format_name.lower()
+        if fmt in self.YOLO_FORMATS:
+            return self._delete_yolo_classes(dataset_path, classes_to_delete)
+        elif fmt == "coco":
+            return self._delete_coco_classes(dataset_path, classes_to_delete)
+        elif fmt in ("pascal-voc", "voc"):
+            return self._delete_voc_classes(dataset_path, classes_to_delete)
+        elif fmt == "labelme":
+            return self._delete_labelme_classes(dataset_path, classes_to_delete)
+        return {"deleted_annotations": 0, "affected_images": 0}
+
+    def _delete_yolo_classes(self, dataset_path: Path, classes_to_delete: List[str]) -> Dict[str, Any]:
+        root = self._find_dataset_root(dataset_path)
+        all_classes, yaml_file, yaml_config = self._load_yolo_meta(root)
+
+        del_set = set(classes_to_delete)
+        class_to_id = {n: i for i, n in enumerate(all_classes)}
+        del_ids = {class_to_id[c] for c in del_set if c in class_to_id}
+
+        remaining = [c for c in all_classes if c not in del_set]
+        old_to_new: Dict[int, int] = {}
+        new_idx = 0
+        for i, name in enumerate(all_classes):
+            if name not in del_set:
+                old_to_new[i] = new_idx
+                new_idx += 1
+
+        deleted = affected = 0
+        for lbl in self._find_yolo_label_files(root):
+            try:
+                with open(lbl) as f:
+                    lines = f.readlines()
+            except Exception:
+                continue
+            new_lines, changed = [], False
+            for line in lines:
+                parts = line.strip().split()
+                if not parts:
+                    continue
+                try:
+                    cid = int(parts[0])
+                except ValueError:
+                    new_lines.append(line)
+                    continue
+                if cid in del_ids:
+                    deleted += 1
+                    changed = True
+                else:
+                    new_id = old_to_new.get(cid, cid)
+                    new_lines.append(f"{new_id} " + " ".join(parts[1:]) + "\n")
+            if changed:
+                affected += 1
+                with open(lbl, "w") as f:
+                    f.writelines(new_lines)
+
+        if yaml_file:
+            self._save_yolo_meta(yaml_file, yaml_config, remaining)
+
+        return {"deleted_annotations": deleted, "affected_images": affected}
+
+    def _delete_coco_classes(self, dataset_path: Path, classes_to_delete: List[str]) -> Dict[str, Any]:
+        root = self._find_dataset_root(dataset_path)
+        jf = self._find_coco_json(root)
+        if not jf:
+            return {"deleted_annotations": 0, "affected_images": 0}
+        with open(jf) as f:
+            data = json.load(f)
+
+        del_set = set(classes_to_delete)
+        del_ids = {c["id"] for c in data["categories"] if c["name"] in del_set}
+        orig = len(data["annotations"])
+        data["annotations"] = [a for a in data["annotations"] if a["category_id"] not in del_ids]
+        data["categories"] = [c for c in data["categories"] if c["name"] not in del_set]
+        affected = len({a["image_id"] for a in data["annotations"]})
+
+        with open(jf, "w") as f:
+            json.dump(data, f, indent=2)
+        return {"deleted_annotations": orig - len(data["annotations"]), "affected_images": affected}
+
+    def _delete_voc_classes(self, dataset_path: Path, classes_to_delete: List[str]) -> Dict[str, Any]:
+        root = self._find_dataset_root(dataset_path)
+        del_set = set(classes_to_delete)
+        deleted = affected = 0
+        for xf in root.glob("**/*.xml"):
+            try:
+                tree = ET.parse(xf)
+                re_ = tree.getroot()
+            except Exception:
+                continue
+            to_rm = [o for o in re_.findall("object")
+                     if o.find("name") is not None and o.find("name").text in del_set]
+            if to_rm:
+                for o in to_rm:
+                    re_.remove(o)
+                    deleted += 1
+                affected += 1
+                with open(xf, "w") as f:
+                    f.write(minidom.parseString(ET.tostring(re_)).toprettyxml(indent="  "))
+        return {"deleted_annotations": deleted, "affected_images": affected}
+
+    def _delete_labelme_classes(self, dataset_path: Path, classes_to_delete: List[str]) -> Dict[str, Any]:
+        root = self._find_dataset_root(dataset_path)
+        del_set = set(classes_to_delete)
+        deleted = affected = 0
+        for jf in root.glob("**/*.json"):
+            try:
+                with open(jf) as f:
+                    data = json.load(f)
+                if "shapes" not in data:
+                    continue
+            except Exception:
+                continue
+            orig = len(data["shapes"])
+            data["shapes"] = [s for s in data["shapes"] if s.get("label") not in del_set]
+            rm = orig - len(data["shapes"])
+            if rm:
+                deleted += rm
+                affected += 1
+                with open(jf, "w") as f:
+                    json.dump(data, f, indent=2)
+        return {"deleted_annotations": deleted, "affected_images": affected}
+
+    # ── merge ────────────────────────────────────────────────────────
+
+    def merge_classes(
+        self,
+        dataset_path: Path,
+        format_name: str,
+        source_classes: List[str],
+        target_class: str,
+    ) -> Dict[str, Any]:
+        """Merge source_classes into target_class."""
+        dataset_path = Path(dataset_path)
+        fmt = format_name.lower()
+        if fmt in self.YOLO_FORMATS:
+            return self._merge_yolo_classes(dataset_path, source_classes, target_class)
+        elif fmt == "coco":
+            return self._merge_coco_classes(dataset_path, source_classes, target_class)
+        elif fmt in ("pascal-voc", "voc"):
+            return self._merge_voc_classes(dataset_path, source_classes, target_class)
+        elif fmt == "labelme":
+            return self._merge_labelme_classes(dataset_path, source_classes, target_class)
+        return {"merged_annotations": 0}
+
+    def _merge_yolo_classes(self, dataset_path: Path, source_classes: List[str], target_class: str) -> Dict[str, Any]:
+        root = self._find_dataset_root(dataset_path)
+        all_classes, yaml_file, yaml_config = self._load_yolo_meta(root)
+
+        src_set = set(source_classes)
+
+        # Ensure target exists
+        if target_class not in all_classes:
+            all_classes.append(target_class)
+
+        class_to_id = {n: i for i, n in enumerate(all_classes)}
+        target_old_id = class_to_id[target_class]
+        src_ids = {class_to_id[c] for c in src_set if c in class_to_id and c != target_class}
+
+        # New class list: remove source classes that aren't the target
+        new_classes = [c for c in all_classes if c not in src_set or c == target_class]
+        new_class_to_id = {n: i for i, n in enumerate(new_classes)}
+        old_to_new: Dict[int, int] = {}
+        for i, name in enumerate(all_classes):
+            if name in src_set and name != target_class:
+                old_to_new[i] = new_class_to_id[target_class]
+            else:
+                old_to_new[i] = new_class_to_id.get(name, i)
+
+        merged = 0
+        for lbl in self._find_yolo_label_files(root):
+            try:
+                with open(lbl) as f:
+                    lines = f.readlines()
+            except Exception:
+                continue
+            new_lines, changed = [], False
+            for line in lines:
+                parts = line.strip().split()
+                if not parts:
+                    continue
+                try:
+                    cid = int(parts[0])
+                except ValueError:
+                    new_lines.append(line)
+                    continue
+                new_id = old_to_new.get(cid, cid)
+                if new_id != cid:
+                    merged += 1
+                    changed = True
+                new_lines.append(f"{new_id} " + " ".join(parts[1:]) + "\n")
+            if changed:
+                with open(lbl, "w") as f:
+                    f.writelines(new_lines)
+
+        if yaml_file:
+            self._save_yolo_meta(yaml_file, yaml_config, new_classes)
+
+        return {"merged_annotations": merged}
+
+    def _merge_coco_classes(self, dataset_path: Path, source_classes: List[str], target_class: str) -> Dict[str, Any]:
+        root = self._find_dataset_root(dataset_path)
+        jf = self._find_coco_json(root)
+        if not jf:
+            return {"merged_annotations": 0}
+        with open(jf) as f:
+            data = json.load(f)
+
+        src_set = set(source_classes)
+        target_cat = next((c for c in data["categories"] if c["name"] == target_class), None)
+        if not target_cat:
+            max_id = max((c["id"] for c in data["categories"]), default=0)
+            target_cat = {"id": max_id + 1, "name": target_class, "supercategory": "none"}
+            data["categories"].append(target_cat)
+        target_id = target_cat["id"]
+
+        src_ids = {c["id"] for c in data["categories"] if c["name"] in src_set and c["name"] != target_class}
+        merged = 0
+        for ann in data["annotations"]:
+            if ann["category_id"] in src_ids:
+                ann["category_id"] = target_id
+                merged += 1
+        data["categories"] = [c for c in data["categories"] if c["name"] not in src_set or c["name"] == target_class]
+
+        with open(jf, "w") as f:
+            json.dump(data, f, indent=2)
+        return {"merged_annotations": merged}
+
+    def _merge_voc_classes(self, dataset_path: Path, source_classes: List[str], target_class: str) -> Dict[str, Any]:
+        root = self._find_dataset_root(dataset_path)
+        src_set = set(source_classes)
+        merged = 0
+        for xf in root.glob("**/*.xml"):
+            try:
+                tree = ET.parse(xf)
+                re_ = tree.getroot()
+            except Exception:
+                continue
+            changed = False
+            for obj in re_.findall("object"):
+                name_el = obj.find("name")
+                if name_el is not None and name_el.text in src_set and name_el.text != target_class:
+                    name_el.text = target_class
+                    merged += 1
+                    changed = True
+            if changed:
+                with open(xf, "w") as f:
+                    f.write(minidom.parseString(ET.tostring(re_)).toprettyxml(indent="  "))
+        return {"merged_annotations": merged}
+
+    def _merge_labelme_classes(self, dataset_path: Path, source_classes: List[str], target_class: str) -> Dict[str, Any]:
+        root = self._find_dataset_root(dataset_path)
+        src_set = set(source_classes)
+        merged = 0
+        for jf in root.glob("**/*.json"):
+            try:
+                with open(jf) as f:
+                    data = json.load(f)
+                if "shapes" not in data:
+                    continue
+            except Exception:
+                continue
+            changed = False
+            for s in data["shapes"]:
+                if s.get("label") in src_set and s.get("label") != target_class:
+                    s["label"] = target_class
+                    merged += 1
+                    changed = True
+            if changed:
+                with open(jf, "w") as f:
+                    json.dump(data, f, indent=2)
+        return {"merged_annotations": merged}
+
+    # ── rename ───────────────────────────────────────────────────────
+
+    def rename_class(
+        self,
+        dataset_path: Path,
+        format_name: str,
+        old_name: str,
+        new_name: str,
+    ) -> Dict[str, Any]:
+        """Rename a single class across all annotations."""
+        dataset_path = Path(dataset_path)
+        fmt = format_name.lower()
+        if fmt in self.YOLO_FORMATS:
+            return self._rename_yolo_class(dataset_path, old_name, new_name)
+        elif fmt == "coco":
+            return self._rename_coco_class(dataset_path, old_name, new_name)
+        elif fmt in ("pascal-voc", "voc"):
+            return self._rename_voc_class(dataset_path, old_name, new_name)
+        elif fmt == "labelme":
+            return self._rename_labelme_class(dataset_path, old_name, new_name)
+        return {"renamed_annotations": 0}
+
+    def _rename_yolo_class(self, dataset_path: Path, old_name: str, new_name: str) -> Dict[str, Any]:
+        root = self._find_dataset_root(dataset_path)
+        all_classes, yaml_file, yaml_config = self._load_yolo_meta(root)
+        if old_name not in all_classes:
+            return {"renamed_annotations": 0}
+        new_classes = [new_name if c == old_name else c for c in all_classes]
+        old_id = all_classes.index(old_name)
+        renamed = 0
+        for lbl in self._find_yolo_label_files(root):
+            try:
+                with open(lbl) as f:
+                    for line in f:
+                        parts = line.strip().split()
+                        if parts and int(parts[0]) == old_id:
+                            renamed += 1
+            except Exception:
+                pass
+        if yaml_file:
+            self._save_yolo_meta(yaml_file, yaml_config, new_classes)
+        return {"renamed_annotations": renamed}
+
+    def _rename_coco_class(self, dataset_path: Path, old_name: str, new_name: str) -> Dict[str, Any]:
+        root = self._find_dataset_root(dataset_path)
+        jf = self._find_coco_json(root)
+        if not jf:
+            return {"renamed_annotations": 0}
+        with open(jf) as f:
+            data = json.load(f)
+        cat_id = None
+        for cat in data["categories"]:
+            if cat["name"] == old_name:
+                cat["name"] = new_name
+                cat_id = cat["id"]
+                break
+        if cat_id is None:
+            return {"renamed_annotations": 0}
+        renamed = sum(1 for a in data["annotations"] if a["category_id"] == cat_id)
+        with open(jf, "w") as f:
+            json.dump(data, f, indent=2)
+        return {"renamed_annotations": renamed}
+
+    def _rename_voc_class(self, dataset_path: Path, old_name: str, new_name: str) -> Dict[str, Any]:
+        root = self._find_dataset_root(dataset_path)
+        renamed = 0
+        for xf in root.glob("**/*.xml"):
+            try:
+                tree = ET.parse(xf)
+                re_ = tree.getroot()
+            except Exception:
+                continue
+            changed = False
+            for obj in re_.findall("object"):
+                name_el = obj.find("name")
+                if name_el is not None and name_el.text == old_name:
+                    name_el.text = new_name
+                    renamed += 1
+                    changed = True
+            if changed:
+                with open(xf, "w") as f:
+                    f.write(minidom.parseString(ET.tostring(re_)).toprettyxml(indent="  "))
+        return {"renamed_annotations": renamed}
+
+    def _rename_labelme_class(self, dataset_path: Path, old_name: str, new_name: str) -> Dict[str, Any]:
+        root = self._find_dataset_root(dataset_path)
+        renamed = 0
+        for jf in root.glob("**/*.json"):
+            try:
+                with open(jf) as f:
+                    data = json.load(f)
+                if "shapes" not in data:
+                    continue
+            except Exception:
+                continue
+            changed = False
+            for s in data["shapes"]:
+                if s.get("label") == old_name:
+                    s["label"] = new_name
+                    renamed += 1
+                    changed = True
+            if changed:
+                with open(jf, "w") as f:
+                    json.dump(data, f, indent=2)
+        return {"renamed_annotations": renamed}
+
     def create_empty_annotation(
         self,
         dataset_path: Path,

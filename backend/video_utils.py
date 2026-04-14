@@ -4,6 +4,7 @@ Video Frame Extraction and Duplicate Detection Utilities
 
 import os
 import hashlib
+import threading
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple
 import numpy as np
@@ -381,11 +382,21 @@ class CLIPEmbeddingManager:
     Use CLIP embeddings for semantic similarity detection
     Requires: pip install transformers torch
     """
-    
+
     def __init__(self):
         self.model = None
         self.processor = None
         self.embeddings_cache: Dict[str, np.ndarray] = {}
+        # Per-dataset cache: dataset_path -> (valid_images_relative, similarities_matrix, total_images)
+        self.dataset_cache: Dict[str, Any] = {}
+        # Per-dataset cancellation events for cooperative cancellation
+        self._cancel_events: Dict[str, threading.Event] = {}
+
+    def cancel_scan(self, dataset_id: str):
+        """Signal an in-progress CLIP scan to stop."""
+        event = self._cancel_events.get(dataset_id)
+        if event:
+            event.set()
     
     def load_model(self):
         """Load CLIP model"""
@@ -428,95 +439,132 @@ class CLIPEmbeddingManager:
         except Exception:
             return None
     
-    def find_similar_images(
+    def _build_groups(
         self,
+        valid_images: List[Path],
+        similarities: np.ndarray,
+        similarity_threshold: float,
         dataset_path: Path,
-        similarity_threshold: float = 0.9,
-        batch_size: int = 32
+        total_images: int,
     ) -> Dict[str, Any]:
-        """
-        Find semantically similar images using CLIP embeddings
-        
-        Args:
-            dataset_path: Path to the dataset
-            similarity_threshold: Cosine similarity threshold (0-1)
-            batch_size: Batch size for processing
-        
-        Returns:
-            Dictionary with similar image groups
-        """
-        if self.model is None:
-            result = self.load_model()
-            if not result["success"]:
-                return result
-        
-        dataset_path = Path(dataset_path)
-        IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
-        
-        # Find all images
-        images = []
-        for ext in IMAGE_EXTENSIONS:
-            images.extend(dataset_path.glob(f"**/*{ext}"))
-            images.extend(dataset_path.glob(f"**/*{ext.upper()}"))
-        
-        # Compute embeddings
-        embeddings = []
-        valid_images = []
-        
-        for img_path in images:
-            emb = self.compute_embedding(img_path)
-            if emb is not None:
-                embeddings.append(emb)
-                valid_images.append(img_path)
-        
-        if not embeddings:
-            return {"success": False, "error": "No valid images found"}
-        
-        # Convert to numpy array
-        embeddings = np.array(embeddings)
-        
-        # Normalize embeddings
-        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-        embeddings = embeddings / norms
-        
-        # Compute pairwise similarities
-        similarities = np.dot(embeddings, embeddings.T)
-        
-        # Find similar pairs
+        """Group images by similarity threshold using a precomputed similarity matrix."""
         similar_groups: List[List[Dict[str, Any]]] = []
         processed: set = set()
-        
+
         for i in range(len(valid_images)):
             if i in processed:
                 continue
-            
-            group = [{
+
+            group: List[Dict[str, Any]] = [{
                 "path": str(valid_images[i].relative_to(dataset_path)),
                 "full_path": str(valid_images[i]),
-                "is_original": True
+                "is_original": True,
             }]
-            
+
             for j in range(i + 1, len(valid_images)):
                 if j in processed:
                     continue
-                
                 if similarities[i, j] >= similarity_threshold:
                     group.append({
                         "path": str(valid_images[j].relative_to(dataset_path)),
                         "full_path": str(valid_images[j]),
                         "similarity": float(similarities[i, j]),
-                        "is_original": False
+                        "is_original": False,
                     })
                     processed.add(j)
-            
+
             if len(group) > 1:
                 similar_groups.append(group)
                 processed.add(i)
-        
+
         return {
             "success": True,
-            "total_images": len(images),
+            "total_images": total_images,
             "similar_groups": len(similar_groups),
             "total_similar": sum(len(g) - 1 for g in similar_groups),
-            "groups": similar_groups
+            "groups": similar_groups,
         }
+
+    def find_similar_images(
+        self,
+        dataset_path: Path,
+        similarity_threshold: float = 0.9,
+        batch_size: int = 32,
+        dataset_id: str = "",
+    ) -> Dict[str, Any]:
+        """
+        Find semantically similar images using CLIP embeddings.
+        Embeddings are cached so regroup_by_threshold can be called
+        without recomputing them.
+        Pass dataset_id to enable cooperative cancellation via cancel_scan().
+        """
+        if self.model is None:
+            result = self.load_model()
+            if not result["success"]:
+                return result
+
+        dataset_path = Path(dataset_path)
+        IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
+
+        # Set up a fresh cancel event for this scan
+        cancel_event = threading.Event()
+        if dataset_id:
+            self._cancel_events[dataset_id] = cancel_event
+
+        # Find all images
+        images = []
+        for ext in IMAGE_EXTENSIONS:
+            images.extend(dataset_path.glob(f"**/*{ext}"))
+            images.extend(dataset_path.glob(f"**/*{ext.upper()}"))
+
+        # Compute embeddings
+        embeddings = []
+        valid_images = []
+
+        for img_path in images:
+            if cancel_event.is_set():
+                if dataset_id:
+                    self._cancel_events.pop(dataset_id, None)
+                return {"success": False, "error": "Scan cancelled"}
+            emb = self.compute_embedding(img_path)
+            if emb is not None:
+                embeddings.append(emb)
+                valid_images.append(img_path)
+
+        if dataset_id:
+            self._cancel_events.pop(dataset_id, None)
+
+        if not embeddings:
+            return {"success": False, "error": "No valid images found"}
+
+        # Convert to numpy array and normalize
+        emb_array = np.array(embeddings)
+        norms = np.linalg.norm(emb_array, axis=1, keepdims=True)
+        emb_array = emb_array / norms
+
+        # Compute pairwise similarities
+        similarities = np.dot(emb_array, emb_array.T)
+
+        # Cache for regroup_by_threshold
+        self.dataset_cache[str(dataset_path)] = (valid_images, similarities, len(images))
+
+        return self._build_groups(valid_images, similarities, similarity_threshold, dataset_path, len(images))
+
+    def regroup_by_threshold(
+        self,
+        dataset_path: Path,
+        similarity_threshold: float = 0.9,
+    ) -> Dict[str, Any]:
+        """
+        Re-group images using cached embeddings — no recomputation needed.
+        Returns an error if find_similar_images has not been run for this dataset yet.
+        """
+        cache_key = str(Path(dataset_path))
+        if cache_key not in self.dataset_cache:
+            return {
+                "success": False,
+                "error": "No cached embeddings for this dataset. Run a full scan first.",
+            }
+
+        valid_images, similarities, total_images = self.dataset_cache[cache_key]
+        return self._build_groups(valid_images, similarities, similarity_threshold, Path(dataset_path), total_images)

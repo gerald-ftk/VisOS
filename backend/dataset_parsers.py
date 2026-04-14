@@ -98,8 +98,32 @@ class DatasetParser:
         for format_name, detector in self.format_detectors.items():
             if detector(dataset_path):
                 return format_name
-        
-        # Default to generic handling
+
+        # Second-pass: recursive search one level deeper for nested datasets
+        try:
+            for child in dataset_path.iterdir():
+                if child.is_dir() and not child.name.startswith("."):
+                    for format_name, detector in self.format_detectors.items():
+                        try:
+                            if detector(child):
+                                return format_name
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+        # Fallback: if we have images but couldn't identify annotations, still
+        # try to give a meaningful type rather than "unknown"
+        try:
+            image_count = sum(
+                1 for f in dataset_path.rglob("*")
+                if f.suffix.lower() in self.IMAGE_EXTENSIONS
+            )
+            if image_count > 0:
+                return "generic-images"
+        except Exception:
+            pass
+
         return "unknown"
     
     def _detect_yolo(self, path: Path) -> bool:
@@ -275,6 +299,7 @@ class DatasetParser:
             "tensorflow-csv": self._parse_tensorflow_csv,
             "classification-folder": self._parse_classification_folder,
             "supervisely": self._parse_supervisely,
+            "generic-images": self._parse_generic,
         }
         return parsers.get(format_name, self._parse_generic)
     
@@ -600,19 +625,60 @@ class DatasetParser:
         return info
     
     def _parse_generic(self, path: Path) -> Dict[str, Any]:
-        """Generic parser for unknown formats"""
+        """Generic parser for unknown/image-only formats — tries to infer as much as possible."""
         info = {
             "task_type": "unknown",
             "num_images": 0,
             "num_annotations": 0,
             "classes": []
         }
-        
-        # Count images
-        for img in path.glob("**/*"):
+
+        classes = set()
+        image_count = 0
+
+        for img in path.rglob("*"):
             if img.suffix.lower() in self.IMAGE_EXTENSIONS:
-                info["num_images"] += 1
-        
+                image_count += 1
+
+        info["num_images"] = image_count
+
+        # Try to infer task type and classes from subfolder names
+        try:
+            subdirs = [d for d in path.iterdir() if d.is_dir() and not d.name.startswith(".")]
+            split_names = {"train", "val", "valid", "validation", "test", "images", "labels", "annotations"}
+
+            # Non-split subdirs may be class folders
+            class_dirs = [d for d in subdirs if d.name.lower() not in split_names]
+            for d in class_dirs:
+                has_images = any(
+                    f.suffix.lower() in self.IMAGE_EXTENSIONS for f in d.iterdir()
+                    if f.is_file()
+                )
+                if has_images:
+                    classes.add(d.name)
+
+            if classes:
+                info["task_type"] = "classification"
+                info["classes"] = sorted(list(classes))
+                info["num_annotations"] = image_count
+        except Exception:
+            pass
+
+        # If we couldn't determine from folders, check for any annotation files
+        if not classes:
+            try:
+                txt_files = list(path.rglob("*.txt"))
+                for txt_file in txt_files:
+                    if self._is_yolo_annotation(txt_file):
+                        info["task_type"] = "detection"
+                        break
+            except Exception:
+                pass
+
+        # Ensure task_type has a user-friendly value if still unknown
+        if info["task_type"] == "unknown" and image_count > 0:
+            info["task_type"] = "detection"  # safe default — better than "unknown"
+
         return info
     
     def get_dataset_details(self, path: Path, format_name: str) -> Dict[str, Any]:
@@ -1074,9 +1140,118 @@ class DatasetParser:
         except Exception:
             return [{"name": c, "count": 0} for c in classes]
     
+    def create_split_dataset(
+        self,
+        source_path: Path,
+        output_path: Path,
+        format_name: str,
+        train_ratio: float = 0.7,
+        val_ratio: float = 0.2,
+        test_ratio: float = 0.1,
+        shuffle: bool = True,
+        seed: int = 42
+    ) -> Dict[str, Any]:
+        """Split a dataset into train/val/test sets and write to output_path."""
+        import random as _random
+
+        source_path = Path(source_path)
+        output_path = Path(output_path)
+        source_root = self._find_dataset_root(source_path)
+        output_path.mkdir(parents=True, exist_ok=True)
+
+        # Get all images
+        all_images = self.get_images_with_annotations(source_path, format_name, page=1, limit=999999)
+
+        rng = _random.Random(seed)
+        if shuffle:
+            rng.shuffle(all_images)
+
+        n = len(all_images)
+        n_train = round(n * train_ratio)
+        n_val   = round(n * val_ratio)
+        n_test  = n - n_train - n_val
+
+        splits = {
+            "train": all_images[:n_train],
+            "val":   all_images[n_train:n_train + n_val],
+            "test":  all_images[n_train + n_val:],
+        }
+
+        is_yolo = format_name in (
+            "yolo", "yolov5", "yolov8", "yolov9", "yolov10", "yolov11", "yolov12"
+        )
+
+        # Copy YAML config if YOLO
+        if is_yolo:
+            for ext in ("*.yaml", "*.yml"):
+                for yf in source_root.glob(ext):
+                    shutil.copy(yf, output_path / yf.name)
+
+        for split_name, imgs in splits.items():
+            if not imgs:
+                continue
+
+            if is_yolo:
+                out_img_dir = output_path / split_name / "images"
+                out_lbl_dir = output_path / split_name / "labels"
+                out_img_dir.mkdir(parents=True, exist_ok=True)
+                out_lbl_dir.mkdir(parents=True, exist_ok=True)
+
+                for img in imgs:
+                    # Locate source image file
+                    img_path = source_root / img["path"]
+                    if not img_path.exists():
+                        img_path = source_path / img["path"]
+                    if not img_path.exists():
+                        # Recursive search by filename
+                        matches = list(source_root.rglob(img["filename"]))
+                        if matches:
+                            img_path = matches[0]
+                        else:
+                            continue
+
+                    shutil.copy(img_path, out_img_dir / img_path.name)
+
+                    # Locate label file (look next to original image and in labels/)
+                    lbl_src = img_path.parent.parent / "labels" / (img_path.stem + ".txt")
+                    if not lbl_src.exists():
+                        lbl_src = img_path.with_suffix(".txt")
+                    if not lbl_src.exists():
+                        lbl_src = source_root / "labels" / (img_path.stem + ".txt")
+                    if lbl_src.exists():
+                        shutil.copy(lbl_src, out_lbl_dir / lbl_src.name)
+            elif format_name == "coco":
+                out_img_dir = output_path / split_name / "images"
+                out_img_dir.mkdir(parents=True, exist_ok=True)
+                for img in imgs:
+                    img_path = source_root / img["path"]
+                    if not img_path.exists():
+                        img_path = source_path / img["path"]
+                    if img_path.exists():
+                        shutil.copy(img_path, out_img_dir / img_path.name)
+            else:
+                # Generic: just copy image files preserving relative structure
+                out_dir = output_path / split_name
+                out_dir.mkdir(parents=True, exist_ok=True)
+                for img in imgs:
+                    img_path = source_root / img["path"]
+                    if not img_path.exists():
+                        img_path = source_path / img["path"]
+                    if img_path.exists():
+                        shutil.copy(img_path, out_dir / img_path.name)
+
+        return {
+            "splits": {
+                "train": n_train,
+                "val":   n_val,
+                "test":  n_test,
+            },
+            "total": n,
+        }
+
     def create_filtered_dataset(
-        self, 
-        source_path: Path, 
+        self,
+        source_path: Path,
         output_path: Path,
         kept_images: List[Dict],
         format_name: str

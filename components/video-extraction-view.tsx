@@ -280,7 +280,7 @@ export function VideoExtractionView({
   }
 
   return (
-    <div className="h-full flex flex-col p-6 overflow-y-auto">
+    <div className="flex flex-col p-6 overflow-y-auto min-h-full">
       <div className="flex items-center justify-between mb-6">
         <div>
           <h2 className="text-2xl font-semibold text-foreground">Video Frame Extraction</h2>
@@ -358,7 +358,7 @@ export function VideoExtractionView({
         </div>
       )}
 
-      <div className="flex gap-6 flex-1 min-h-0">
+      <div className="flex gap-6 flex-1">
         {/* Video List */}
         <Card className="w-64 flex-shrink-0 flex flex-col">
           <CardHeader className="pb-3">
@@ -412,7 +412,7 @@ export function VideoExtractionView({
         </Card>
 
         {/* Video Player & Settings */}
-        <div className="flex-1 flex flex-col overflow-hidden">
+        <div className="flex-1 flex flex-col min-w-0">
           {selectedVideo ? (
             <>
               {/* Video Player */}
@@ -421,7 +421,7 @@ export function VideoExtractionView({
                   <div className="relative aspect-video bg-black rounded-lg overflow-hidden mb-4">
                     <video
                       ref={videoRef}
-                      src={selectedVideo.url}
+                      src={selectedVideo.url.startsWith('http') ? selectedVideo.url : `${apiUrl}${selectedVideo.url}`}
                       className="w-full h-full object-contain"
                       onTimeUpdate={handleTimeUpdate}
                       onEnded={() => setIsPlaying(false)}
@@ -475,14 +475,14 @@ export function VideoExtractionView({
               </Card>
 
               {/* Extraction Settings */}
-              <Card className="flex-1 overflow-hidden flex flex-col">
+              <Card className="flex flex-col">
                 <CardHeader className="pb-3">
                   <CardTitle className="text-base">Extraction Settings</CardTitle>
                   <CardDescription>
                     Configure how frames are extracted
                   </CardDescription>
                 </CardHeader>
-                <CardContent className="flex-1 overflow-y-auto">
+                <CardContent>
                   <Tabs value={extractionMode} onValueChange={(v) => setExtractionMode(v as ExtractionMode)}>
                     <TabsList className="mb-4">
                       <TabsTrigger value="interval">
@@ -541,18 +541,31 @@ export function VideoExtractionView({
                     <TabsContent value="interval" className="space-y-4 mt-0">
                       <div className="space-y-2">
                         <div className="flex items-center justify-between">
-                          <Label>Frame Interval</Label>
+                          <Label>Extract every Nth frame</Label>
                           <span className="text-sm text-muted-foreground">
-                            Every {frameInterval} frames ({(frameInterval / selectedVideo.fps).toFixed(2)}s)
+                            Every {frameInterval} frames ({(frameInterval / selectedVideo.fps).toFixed(2)}s apart)
                           </span>
                         </div>
-                        <Slider
-                          value={[frameInterval]}
-                          onValueChange={([v]) => setFrameInterval(v)}
-                          min={1}
-                          max={120}
-                          step={1}
-                        />
+                        <div className="flex gap-3 items-center">
+                          <Slider
+                            value={[frameInterval]}
+                            onValueChange={([v]) => setFrameInterval(v)}
+                            min={1}
+                            max={300}
+                            step={1}
+                            className="flex-1"
+                          />
+                          <Input
+                            type="number"
+                            value={frameInterval}
+                            onChange={(e) => setFrameInterval(Math.max(1, parseInt(e.target.value) || 1))}
+                            min={1}
+                            className="w-20"
+                          />
+                        </div>
+                        <p className="text-xs text-muted-foreground">
+                          N=1 extracts every frame, N=30 extracts 1 frame per second at 30fps
+                        </p>
                       </div>
                     </TabsContent>
 

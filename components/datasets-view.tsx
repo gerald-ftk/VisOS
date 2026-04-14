@@ -303,8 +303,21 @@ export function DatasetsView({
       case 'classification': return 'bg-blue-500/10 text-blue-600 dark:text-blue-400'
       case 'detection': return 'bg-green-500/10 text-green-600 dark:text-green-400'
       case 'segmentation': return 'bg-purple-500/10 text-purple-600 dark:text-purple-400'
+      case 'keypoint': return 'bg-orange-500/10 text-orange-600 dark:text-orange-400'
+      case 'obb-detection': return 'bg-teal-500/10 text-teal-600 dark:text-teal-400'
       default: return 'bg-muted text-muted-foreground'
     }
+  }
+
+  const getFormatLabel = (format: string) => {
+    if (!format || format === 'unknown') return 'UNKNOWN FORMAT'
+    if (format === 'generic-images') return 'IMAGES'
+    return format.toUpperCase()
+  }
+
+  const getTaskTypeLabel = (taskType: string) => {
+    if (!taskType || taskType === 'unknown') return 'unknown type'
+    return taskType
   }
 
   const getProgressLabel = () => {
@@ -463,10 +476,10 @@ export function DatasetsView({
                       <CardTitle className="text-sm font-semibold truncate">{dataset.name}</CardTitle>
                       <div className="flex items-center gap-1.5 mt-1.5 flex-wrap">
                         <span className="inline-flex items-center px-2 py-0.5 bg-secondary rounded-md text-[10px] font-mono font-medium">
-                          {dataset.format.toUpperCase()}
+                          {getFormatLabel(dataset.format)}
                         </span>
                         <span className={cn('px-2 py-0.5 rounded-md text-[10px] font-medium', getTaskTypeColor(dataset.task_type))}>
-                          {dataset.task_type}
+                          {getTaskTypeLabel(dataset.task_type)}
                         </span>
                       </div>
                     </div>

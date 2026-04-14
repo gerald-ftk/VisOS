@@ -92,61 +92,72 @@ interface TrainingStatus {
 // Constants
 // ---------------------------------------------------------------------------
 
-const MODEL_ARCHITECTURES: Array<{ value: string; label: string; params: string; taskType: string }> = [
-  // ── YOLOv8 ──────────────────────────────────────────────────────────────────
-  { value: "yolov8n",      label: "YOLOv8 Nano",       params: "3.2M",  taskType: "yolo" },
-  { value: "yolov8s",      label: "YOLOv8 Small",      params: "11.2M", taskType: "yolo" },
-  { value: "yolov8m",      label: "YOLOv8 Medium",     params: "25.9M", taskType: "yolo" },
-  { value: "yolov8l",      label: "YOLOv8 Large",      params: "43.7M", taskType: "yolo" },
-  { value: "yolov8x",      label: "YOLOv8 XLarge",     params: "68.2M", taskType: "yolo" },
-  { value: "yolov8n-seg",  label: "YOLOv8n Seg",       params: "3.4M",  taskType: "segmentation" },
-  { value: "yolov8s-seg",  label: "YOLOv8s Seg",       params: "11.8M", taskType: "segmentation" },
-  { value: "yolov8m-seg",  label: "YOLOv8m Seg",       params: "27.3M", taskType: "segmentation" },
-  { value: "yolov8n-cls",  label: "YOLOv8n Cls",       params: "2.7M",  taskType: "classification" },
-  { value: "yolov8s-cls",  label: "YOLOv8s Cls",       params: "6.4M",  taskType: "classification" },
-  // ── YOLOv9 ──────────────────────────────────────────────────────────────────
-  { value: "yolov9n",      label: "YOLOv9 Nano",       params: "2.0M",  taskType: "yolo" },
-  { value: "yolov9s",      label: "YOLOv9 Small",      params: "7.2M",  taskType: "yolo" },
-  { value: "yolov9m",      label: "YOLOv9 Medium",     params: "20.1M", taskType: "yolo" },
-  { value: "yolov9c",      label: "YOLOv9 Compact",    params: "25.5M", taskType: "yolo" },
-  { value: "yolov9e",      label: "YOLOv9 Extended",   params: "57.8M", taskType: "yolo" },
-  // ── YOLOv10 ─────────────────────────────────────────────────────────────────
-  { value: "yolov10n",     label: "YOLOv10 Nano",      params: "2.3M",  taskType: "yolo" },
-  { value: "yolov10s",     label: "YOLOv10 Small",     params: "7.2M",  taskType: "yolo" },
-  { value: "yolov10m",     label: "YOLOv10 Medium",    params: "15.4M", taskType: "yolo" },
-  { value: "yolov10b",     label: "YOLOv10 Balanced",  params: "19.1M", taskType: "yolo" },
-  { value: "yolov10l",     label: "YOLOv10 Large",     params: "24.4M", taskType: "yolo" },
-  { value: "yolov10x",     label: "YOLOv10 XLarge",    params: "29.5M", taskType: "yolo" },
-  // ── YOLO11 ──────────────────────────────────────────────────────────────────
-  { value: "yolo11n",      label: "YOLO11 Nano",       params: "2.6M",  taskType: "yolo" },
-  { value: "yolo11s",      label: "YOLO11 Small",      params: "9.4M",  taskType: "yolo" },
-  { value: "yolo11m",      label: "YOLO11 Medium",     params: "20.1M", taskType: "yolo" },
-  { value: "yolo11l",      label: "YOLO11 Large",      params: "25.3M", taskType: "yolo" },
-  { value: "yolo11x",      label: "YOLO11 XLarge",     params: "56.9M", taskType: "yolo" },
-  { value: "yolo11n-seg",  label: "YOLO11n Seg",       params: "2.9M",  taskType: "segmentation" },
-  { value: "yolo11s-seg",  label: "YOLO11s Seg",       params: "10.1M", taskType: "segmentation" },
-  { value: "yolo11n-cls",  label: "YOLO11n Cls",       params: "1.6M",  taskType: "classification" },
-  { value: "yolo11s-cls",  label: "YOLO11s Cls",       params: "5.6M",  taskType: "classification" },
-  // ── YOLO12 ──────────────────────────────────────────────────────────────────
-  { value: "yolo12n",      label: "YOLO12 Nano",       params: "2.6M",  taskType: "yolo" },
-  { value: "yolo12s",      label: "YOLO12 Small",      params: "9.3M",  taskType: "yolo" },
-  { value: "yolo12m",      label: "YOLO12 Medium",     params: "20.2M", taskType: "yolo" },
-  { value: "yolo12l",      label: "YOLO12 Large",      params: "26.4M", taskType: "yolo" },
-  { value: "yolo12x",      label: "YOLO12 XLarge",     params: "59.1M", taskType: "yolo" },
-  // ── RT-DETR (Ultralytics) ────────────────────────────────────────────────────
-  { value: "rtdetr-l",     label: "RT-DETR Large",     params: "32M",   taskType: "rtdetr" },
-  { value: "rtdetr-x",     label: "RT-DETR XLarge",    params: "67M",   taskType: "rtdetr" },
-  // ── RF-DETR (Roboflow) ───────────────────────────────────────────────────────
-  { value: "rfdetr_base",  label: "RF-DETR Base",      params: "29M",   taskType: "rfdetr" },
-  { value: "rfdetr_large", label: "RF-DETR Large",     params: "128M",  taskType: "rfdetr" },
+const MODEL_ARCHITECTURES: Array<{ value: string; label: string; params: string; taskType: string; arch: string }> = [
+  // ── YOLOv8 — detection ──────────────────────────────────────────────────────
+  { value: "yolov8n",      label: "YOLOv8 Nano",       params: "3.2M",  taskType: "detection",      arch: "YOLO" },
+  { value: "yolov8s",      label: "YOLOv8 Small",      params: "11.2M", taskType: "detection",      arch: "YOLO" },
+  { value: "yolov8m",      label: "YOLOv8 Medium",     params: "25.9M", taskType: "detection",      arch: "YOLO" },
+  { value: "yolov8l",      label: "YOLOv8 Large",      params: "43.7M", taskType: "detection",      arch: "YOLO" },
+  { value: "yolov8x",      label: "YOLOv8 XLarge",     params: "68.2M", taskType: "detection",      arch: "YOLO" },
+  // ── YOLOv8 — segmentation ───────────────────────────────────────────────────
+  { value: "yolov8n-seg",  label: "YOLOv8n Seg",       params: "3.4M",  taskType: "segmentation",   arch: "YOLO" },
+  { value: "yolov8s-seg",  label: "YOLOv8s Seg",       params: "11.8M", taskType: "segmentation",   arch: "YOLO" },
+  { value: "yolov8m-seg",  label: "YOLOv8m Seg",       params: "27.3M", taskType: "segmentation",   arch: "YOLO" },
+  // ── YOLOv8 — classification ──────────────────────────────────────────────────
+  { value: "yolov8n-cls",  label: "YOLOv8n Cls",       params: "2.7M",  taskType: "classification", arch: "YOLO" },
+  { value: "yolov8s-cls",  label: "YOLOv8s Cls",       params: "6.4M",  taskType: "classification", arch: "YOLO" },
+  // ── YOLOv9 — detection ──────────────────────────────────────────────────────
+  { value: "yolov9n",      label: "YOLOv9 Nano",       params: "2.0M",  taskType: "detection",      arch: "YOLO" },
+  { value: "yolov9s",      label: "YOLOv9 Small",      params: "7.2M",  taskType: "detection",      arch: "YOLO" },
+  { value: "yolov9m",      label: "YOLOv9 Medium",     params: "20.1M", taskType: "detection",      arch: "YOLO" },
+  { value: "yolov9c",      label: "YOLOv9 Compact",    params: "25.5M", taskType: "detection",      arch: "YOLO" },
+  { value: "yolov9e",      label: "YOLOv9 Extended",   params: "57.8M", taskType: "detection",      arch: "YOLO" },
+  // ── YOLOv10 — detection ─────────────────────────────────────────────────────
+  { value: "yolov10n",     label: "YOLOv10 Nano",      params: "2.3M",  taskType: "detection",      arch: "YOLO" },
+  { value: "yolov10s",     label: "YOLOv10 Small",     params: "7.2M",  taskType: "detection",      arch: "YOLO" },
+  { value: "yolov10m",     label: "YOLOv10 Medium",    params: "15.4M", taskType: "detection",      arch: "YOLO" },
+  { value: "yolov10b",     label: "YOLOv10 Balanced",  params: "19.1M", taskType: "detection",      arch: "YOLO" },
+  { value: "yolov10l",     label: "YOLOv10 Large",     params: "24.4M", taskType: "detection",      arch: "YOLO" },
+  { value: "yolov10x",     label: "YOLOv10 XLarge",    params: "29.5M", taskType: "detection",      arch: "YOLO" },
+  // ── YOLO11 — detection ──────────────────────────────────────────────────────
+  { value: "yolo11n",      label: "YOLO11 Nano",       params: "2.6M",  taskType: "detection",      arch: "YOLO" },
+  { value: "yolo11s",      label: "YOLO11 Small",      params: "9.4M",  taskType: "detection",      arch: "YOLO" },
+  { value: "yolo11m",      label: "YOLO11 Medium",     params: "20.1M", taskType: "detection",      arch: "YOLO" },
+  { value: "yolo11l",      label: "YOLO11 Large",      params: "25.3M", taskType: "detection",      arch: "YOLO" },
+  { value: "yolo11x",      label: "YOLO11 XLarge",     params: "56.9M", taskType: "detection",      arch: "YOLO" },
+  // ── YOLO11 — segmentation ───────────────────────────────────────────────────
+  { value: "yolo11n-seg",  label: "YOLO11n Seg",       params: "2.9M",  taskType: "segmentation",   arch: "YOLO" },
+  { value: "yolo11s-seg",  label: "YOLO11s Seg",       params: "10.1M", taskType: "segmentation",   arch: "YOLO" },
+  // ── YOLO11 — classification ──────────────────────────────────────────────────
+  { value: "yolo11n-cls",  label: "YOLO11n Cls",       params: "1.6M",  taskType: "classification", arch: "YOLO" },
+  { value: "yolo11s-cls",  label: "YOLO11s Cls",       params: "5.6M",  taskType: "classification", arch: "YOLO" },
+  // ── YOLO12 — detection ──────────────────────────────────────────────────────
+  { value: "yolo12n",      label: "YOLO12 Nano",       params: "2.6M",  taskType: "detection",      arch: "YOLO" },
+  { value: "yolo12s",      label: "YOLO12 Small",      params: "9.3M",  taskType: "detection",      arch: "YOLO" },
+  { value: "yolo12m",      label: "YOLO12 Medium",     params: "20.2M", taskType: "detection",      arch: "YOLO" },
+  { value: "yolo12l",      label: "YOLO12 Large",      params: "26.4M", taskType: "detection",      arch: "YOLO" },
+  { value: "yolo12x",      label: "YOLO12 XLarge",     params: "59.1M", taskType: "detection",      arch: "YOLO" },
+  // ── RT-DETR — detection (Ultralytics) ────────────────────────────────────────
+  { value: "rtdetr-l",     label: "RT-DETR Large",     params: "32M",   taskType: "detection",      arch: "RT-DETR" },
+  { value: "rtdetr-x",     label: "RT-DETR XLarge",    params: "67M",   taskType: "detection",      arch: "RT-DETR" },
+  // ── RF-DETR — detection (Roboflow) ───────────────────────────────────────────
+  { value: "rfdetr_base",  label: "RF-DETR Base",      params: "29M",   taskType: "detection",      arch: "RF-DETR" },
+  { value: "rfdetr_large", label: "RF-DETR Large",     params: "128M",  taskType: "detection",      arch: "RF-DETR" },
 ]
 
+/** Derive the backend model_type from the selected architecture value. */
+function getModelType(archValue: string): string {
+  if (archValue.startsWith("rtdetr")) return "rtdetr"
+  if (archValue.startsWith("rfdetr")) return "rfdetr"
+  if (archValue.includes("-seg"))     return "segmentation"
+  if (archValue.includes("-cls"))     return "classification"
+  return "yolo"
+}
+
 const TASK_TYPES = [
-  { value: "yolo",           label: "Object Detection (YOLO)" },
+  { value: "detection",      label: "Object Detection" },
   { value: "segmentation",   label: "Instance Segmentation" },
   { value: "classification", label: "Classification" },
-  { value: "rtdetr",         label: "RT-DETR Detection" },
-  { value: "rfdetr",         label: "RF-DETR Detection" },
 ]
 
 const POLL_INTERVAL_MS = 2000
@@ -155,9 +166,44 @@ const POLL_INTERVAL_MS = 2000
 // Props
 // ---------------------------------------------------------------------------
 
+interface DatasetInfo {
+  id: string
+  name: string
+  path: string
+  format?: string
+  task_type?: string
+}
+
 interface TrainingViewProps {
-  datasets?: Array<{ id: string; name: string; path: string }>
+  datasets?: DatasetInfo[]
   apiUrl?: string
+}
+
+/** Classify a dataset's task domain based on format and task_type fields. */
+function datasetDomain(ds: DatasetInfo): "classification" | "segmentation" | "detection" {
+  const fmt = (ds.format  ?? "").toLowerCase()
+  const tt  = (ds.task_type ?? "").toLowerCase()
+  if (fmt === "classification-folder" || fmt === "classification_folder" || tt === "classification") return "classification"
+  if (fmt === "cityscapes" || fmt === "ade20k" || fmt === "yolo-seg" || tt === "segmentation") return "segmentation"
+  return "detection"
+}
+
+/** Return null if compatible, or an object with error / warning strings. */
+function checkCompatibility(
+  dsDomain: "classification" | "segmentation" | "detection",
+  modelTaskType: string,   // "detection" | "segmentation" | "classification"
+): { error?: string; warning?: string } | null {
+  if (dsDomain === "classification" && modelTaskType !== "classification")
+    return { error: "Classification datasets can only train Classification models." }
+  if (dsDomain === "segmentation" && modelTaskType === "classification")
+    return { error: "Segmentation datasets cannot train Classification models." }
+  if (dsDomain === "detection" && modelTaskType === "segmentation")
+    return { error: "Detection datasets don't contain polygon masks. Use a segmentation-format dataset, or train an Object Detection model instead." }
+  if (dsDomain === "detection" && modelTaskType === "classification")
+    return { error: "Detection datasets cannot train Classification models. Use a classification-folder dataset." }
+  if (dsDomain === "segmentation" && modelTaskType === "detection")
+    return { warning: "This dataset has segmentation masks. Polygons will be automatically converted to bounding boxes for detection training." }
+  return null
 }
 
 // ---------------------------------------------------------------------------
@@ -168,7 +214,7 @@ export function TrainingView({ datasets = [], apiUrl = "http://localhost:8000" }
   // Config state
   const [selectedDatasetId, setSelectedDatasetId] = useState("")
   const [modelArch, setModelArch]     = useState("yolov8n")
-  const [taskType, setTaskType]       = useState("yolo")
+  const [taskType, setTaskType]       = useState("detection")
   const [epochs, setEpochs]           = useState(100)
   const [batchSize, setBatchSize]     = useState(16)
   const [imgSize, setImgSize]         = useState(640)
@@ -222,9 +268,10 @@ export function TrainingView({ datasets = [], apiUrl = "http://localhost:8000" }
   const [hasGpu, setHasGpu]             = useState<boolean | null>(null) // null = unknown yet
   const systemPollRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
-  const pollRef       = useRef<ReturnType<typeof setInterval> | null>(null)
-  const seenLogCount  = useRef(0)
-  const logsEndRef    = useRef<HTMLDivElement>(null)
+  const pollRef          = useRef<ReturnType<typeof setInterval> | null>(null)
+  const seenLogCount     = useRef(0)
+  const logsEndRef       = useRef<HTMLDivElement>(null)
+  const failedPollCount  = useRef(0)   // consecutive polls returning "failed" — stop after threshold
 
   // -------------------------------------------------------------------------
   // Helpers
@@ -275,17 +322,9 @@ export function TrainingView({ datasets = [], apiUrl = "http://localhost:8000" }
   }, [logs])
 
   // -------------------------------------------------------------------------
-  // System stats polling — runs independently while training is active
+  // System stats polling — always active so CPU/RAM/GPU are shown even when idle
   // -------------------------------------------------------------------------
   useEffect(() => {
-    if (!isTraining) {
-      if (systemPollRef.current) {
-        clearInterval(systemPollRef.current)
-        systemPollRef.current = null
-      }
-      return
-    }
-
     const pollSystem = async () => {
       try {
         const res = await fetch(`${apiUrl}/api/system`)
@@ -307,7 +346,9 @@ export function TrainingView({ datasets = [], apiUrl = "http://localhost:8000" }
     }
 
     pollSystem()
-    systemPollRef.current = setInterval(pollSystem, 3000)
+    // Poll every 3 s while training, every 10 s while idle
+    const interval = isTraining ? 3000 : 10000
+    systemPollRef.current = setInterval(pollSystem, interval)
     return () => {
       if (systemPollRef.current) {
         clearInterval(systemPollRef.current)
@@ -357,32 +398,43 @@ export function TrainingView({ datasets = [], apiUrl = "http://localhost:8000" }
         })
 
         if (data.status === "completed") {
+          failedPollCount.current = 0
           setIsTraining(false)
-          setModelPath(data.model_path)
+          if (data.model_path) setModelPath(data.model_path)
           addLog("Training completed successfully! Model saved.", "success")
           setStatusLabel("Completed")
           setGpuUsage(0); setMemoryUsage(0)
           stopPolling()
         } else if (data.status === "failed") {
+          // Keep polling for a grace period so the user can see any final log lines
+          // and download partial weights if available. Stop after 15 consecutive fails.
+          failedPollCount.current += 1
           setIsTraining(false)
+          if (data.model_path) setModelPath(data.model_path)
           setError(data.error ?? "Unknown error")
-          addLog(`Training failed: ${data.error ?? "Unknown error"}`, "error")
           setStatusLabel("Failed")
           setGpuUsage(0); setMemoryUsage(0)
-          stopPolling()
+          if (failedPollCount.current >= 15) {
+            stopPolling()
+          }
         } else if (data.status === "stopped") {
+          failedPollCount.current = 0
           setIsTraining(false)
+          if (data.model_path) setModelPath(data.model_path)
           addLog("Training was stopped.", "warning")
           setStatusLabel("Stopped")
           setGpuUsage(0); setMemoryUsage(0)
           stopPolling()
         } else if (data.status === "paused") {
+          failedPollCount.current = 0
           setIsPaused(true)
           if (data.model_path) setModelPath(data.model_path)
           addLog("Training paused — checkpoint saved. Click Resume to continue.", "info")
           setStatusLabel("Paused")
           setGpuUsage(0); setMemoryUsage(0)
           stopPolling()
+        } else {
+          failedPollCount.current = 0  // reset on any healthy status
         }
       } catch (err) {
         addLog(`Polling error: ${err instanceof Error ? err.message : err}`, "error")
@@ -399,10 +451,32 @@ export function TrainingView({ datasets = [], apiUrl = "http://localhost:8000" }
   // Actions
   // -------------------------------------------------------------------------
 
+  function handleDownloadReport() {
+    if (!trainingId) return
+    window.open(`${apiUrl}/api/train/${trainingId}/report`, "_blank")
+  }
+
   async function handleStartTraining() {
     if (!selectedDatasetId) {
       addLog("Please select a dataset before starting training.", "error")
       return
+    }
+
+    // Dataset / model compatibility check (client-side early warning)
+    const selectedDs = datasets.find(d => d.id === selectedDatasetId)
+    if (selectedDs) {
+      const dsDomain  = datasetDomain(selectedDs)
+      const modelTask = getModelType(modelArch)   // "yolo" | "rtdetr" | "rfdetr" | "segmentation" | "classification"
+      // Map backend model_type to simplified task domain for check
+      const modelDomain = modelTask === "segmentation" ? "segmentation"
+                        : modelTask === "classification" ? "classification"
+                        : "detection"
+      const compat = checkCompatibility(dsDomain, modelDomain)
+      if (compat?.error) {
+        addLog(compat.error, "error")
+        setError(compat.error)
+        return
+      }
     }
 
     // Reset all runtime state
@@ -415,8 +489,11 @@ export function TrainingView({ datasets = [], apiUrl = "http://localhost:8000" }
     setDeviceInfo(null)
     setLiveGpuMem(null)
     seenLogCount.current = 0
+    failedPollCount.current = 0
     setIsPaused(false)
     setStatusLabel("Starting…")
+
+    const backendModelType = getModelType(modelArch)
 
     try {
       const res = await fetch(`${apiUrl}/api/train`, {
@@ -424,7 +501,7 @@ export function TrainingView({ datasets = [], apiUrl = "http://localhost:8000" }
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           dataset_id: selectedDatasetId,
-          model_type: taskType,
+          model_type: backendModelType,
           model_arch: modelArch,
           epochs,
           batch_size: batchSize,
@@ -582,7 +659,7 @@ export function TrainingView({ datasets = [], apiUrl = "http://localhost:8000" }
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-semibold text-foreground">Training</h1>
-          <p className="text-muted-foreground mt-1">Train YOLOv8 models locally on your datasets</p>
+          <p className="text-muted-foreground mt-1">Train YOLO, RT-DETR, and RF-DETR models locally on your datasets</p>
         </div>
         <div className="flex items-center gap-2">
           {isTraining ? (
@@ -602,7 +679,7 @@ export function TrainingView({ datasets = [], apiUrl = "http://localhost:8000" }
               <>
                 <Button variant="outline" onClick={handleExportModel} className="gap-2">
                   <Download className="w-4 h-4" />
-                  Export .pt
+                  Download .pt
                 </Button>
                 <Select value={exportFormat} onValueChange={setExportFormat}>
                   <SelectTrigger className="w-28 h-9">
@@ -625,6 +702,12 @@ export function TrainingView({ datasets = [], apiUrl = "http://localhost:8000" }
                   {isExporting ? "Exporting…" : `Export ${exportFormat.toUpperCase()}`}
                 </Button>
               </>
+            )}
+            {trainingId && metrics.length > 0 && (
+              <Button variant="outline" onClick={handleDownloadReport} className="gap-2">
+                <Package className="w-4 h-4" />
+                Report
+              </Button>
             )}
               <Button onClick={handleStartTraining} className="gap-2">
                 <Play className="w-4 h-4" />
@@ -658,11 +741,35 @@ export function TrainingView({ datasets = [], apiUrl = "http://localhost:8000" }
                   <SelectTrigger><SelectValue placeholder="Select a dataset…" /></SelectTrigger>
                   <SelectContent>
                     {datasets.map(ds => (
-                      <SelectItem key={ds.id} value={ds.id}>{ds.name}</SelectItem>
+                      <SelectItem key={ds.id} value={ds.id}>
+                        <span>{ds.name}</span>
+                        {ds.format && (
+                          <Badge variant="outline" className="ml-2 text-[10px]">{ds.format}</Badge>
+                        )}
+                      </SelectItem>
                     ))}
                   </SelectContent>
                 </Select>
               )}
+              {/* Compatibility notice */}
+              {(() => {
+                const ds = datasets.find(d => d.id === selectedDatasetId)
+                if (!ds) return null
+                const dsDomain  = datasetDomain(ds)
+                const modelTask = getModelType(modelArch)
+                const modelDomain = modelTask === "segmentation" ? "segmentation"
+                                  : modelTask === "classification" ? "classification"
+                                  : "detection"
+                const compat = checkCompatibility(dsDomain, modelDomain)
+                if (!compat) return null
+                if (compat.error) return (
+                  <p className="text-[11px] text-red-400 leading-snug">{compat.error}</p>
+                )
+                if (compat.warning) return (
+                  <p className="text-[11px] text-yellow-400 leading-snug">{compat.warning}</p>
+                )
+                return null
+              })()}
             </div>
 
             <div className="space-y-2">
@@ -688,18 +795,28 @@ export function TrainingView({ datasets = [], apiUrl = "http://localhost:8000" }
 
             <div className="space-y-2">
               <label className="text-sm font-medium">Model Architecture</label>
-              <Select value={modelArch} onValueChange={setModelArch} disabled={isTraining}>
+              <Select
+                value={modelArch}
+                onValueChange={v => {
+                  setModelArch(v)
+                  // Sync task type to match the chosen arch
+                  const m = MODEL_ARCHITECTURES.find(a => a.value === v)
+                  if (m && m.taskType !== taskType) setTaskType(m.taskType)
+                }}
+                disabled={isTraining}
+              >
                 <SelectTrigger><SelectValue /></SelectTrigger>
                 <SelectContent>
                   {MODEL_ARCHITECTURES.filter(m => m.taskType === taskType).map(model => (
                     <SelectItem key={model.value} value={model.value}>
                       <span>{model.label}</span>
-                      <Badge variant="secondary" className="ml-2 text-xs">{model.params}</Badge>
+                      <Badge variant="outline" className="ml-1 text-[10px]">{model.arch}</Badge>
+                      <Badge variant="secondary" className="ml-1 text-[10px]">{model.params}</Badge>
                     </SelectItem>
                   ))}
                 </SelectContent>
               </Select>
-              {taskType === "rfdetr" && (
+              {modelArch.startsWith("rfdetr") && (
                 <p className="text-[11px] text-muted-foreground leading-snug">
                   RF-DETR requires a <span className="text-primary font-medium">COCO-format</span> dataset.
                   Use Convert to transform your dataset first.
@@ -848,8 +965,16 @@ export function TrainingView({ datasets = [], apiUrl = "http://localhost:8000" }
             )}
 
             {modelPath && (
-              <div className="rounded-md bg-green-500/10 border border-green-500/30 p-3 text-xs text-green-400 break-all">
-                ✓ Model saved: {modelPath}
+              <div className={`rounded-md p-3 text-xs break-all space-y-1 ${
+                statusLabel === "Failed"
+                  ? "bg-yellow-500/10 border border-yellow-500/30 text-yellow-400"
+                  : "bg-green-500/10 border border-green-500/30 text-green-400"
+              }`}>
+                <p className="font-semibold">
+                  {statusLabel === "Failed" ? "Partial weights available" : "Model saved"}
+                </p>
+                <p className="font-mono opacity-80">{modelPath}</p>
+                <p>Use the &ldquo;Download .pt&rdquo; button above to save the model file.</p>
               </div>
             )}
           </CardContent>
@@ -1012,7 +1137,7 @@ export function TrainingView({ datasets = [], apiUrl = "http://localhost:8000" }
             <SystemStat
               icon={<Cpu className="w-5 h-5 text-primary" />}
               label={hasGpu === true ? `GPU${gpuName ? ` (${gpuName.split(" ").pop()})` : ""}` : "CPU"}
-              value={isTraining ? `${gpuUsage.toFixed(0)}%` : "—"}
+              value={hasGpu === null ? "—" : `${gpuUsage.toFixed(0)}%`}
               progress={gpuUsage}
             />
             <SystemStat
@@ -1020,7 +1145,7 @@ export function TrainingView({ datasets = [], apiUrl = "http://localhost:8000" }
               label={liveGpuMem != null ? "VRAM Used" : hasGpu === true ? "GPU Memory" : "RAM"}
               value={liveGpuMem != null
                 ? `${liveGpuMem.toFixed(2)} GB`
-                : isTraining ? `${memoryUsage.toFixed(0)}%` : "—"}
+                : hasGpu === null ? "—" : `${memoryUsage.toFixed(0)}%`}
               progress={liveGpuMem == null ? memoryUsage : undefined}
             />
             <SystemStat

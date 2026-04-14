@@ -4,6 +4,7 @@ Format Converter - Convert between different CV annotation formats
 
 import os
 import json
+import math
 import yaml
 import xml.etree.ElementTree as ET
 from xml.dom import minidom
@@ -11,7 +12,7 @@ import csv
 import shutil
 from pathlib import Path
 from typing import Dict, List, Any, Optional
-from PIL import Image
+from PIL import Image, ImageDraw
 
 
 class FormatConverter:
@@ -19,13 +20,19 @@ class FormatConverter:
     
     SUPPORTED_FORMATS = {
         "yolo": {"name": "YOLO/YOLOv5/v8/v9/v10/v11", "extensions": [".txt"], "task": ["detection", "segmentation"]},
-        "yolov8-obb": {"name": "YOLOv8 OBB", "extensions": [".txt"], "task": ["obb-detection"]},
+        "yolo-obb": {"name": "YOLO OBB", "extensions": [".txt"], "task": ["obb-detection"]},
         "coco": {"name": "COCO JSON", "extensions": [".json"], "task": ["detection", "segmentation", "keypoint"]},
+        "coco-panoptic": {"name": "COCO Panoptic", "extensions": [".json", ".png"], "task": ["panoptic-segmentation"]},
         "pascal-voc": {"name": "Pascal VOC XML", "extensions": [".xml"], "task": ["detection"]},
         "createml": {"name": "CreateML JSON", "extensions": [".json"], "task": ["detection"]},
         "tensorflow-csv": {"name": "TensorFlow CSV", "extensions": [".csv"], "task": ["detection"]},
+        "tfrecord": {"name": "TFRecord", "extensions": [".record"], "task": ["detection", "classification"]},
         "labelme": {"name": "LabelMe JSON", "extensions": [".json"], "task": ["detection", "segmentation"]},
         "classification-folder": {"name": "Classification Folders", "extensions": [], "task": ["classification"]},
+        "cityscapes": {"name": "Cityscapes", "extensions": [".json", ".png"], "task": ["segmentation"]},
+        "ade20k": {"name": "ADE20K", "extensions": [".png"], "task": ["segmentation"]},
+        "dota": {"name": "DOTA", "extensions": [".txt"], "task": ["obb-detection"]},
+        "csv": {"name": "CSV", "extensions": [".csv"], "task": ["detection"]},
     }
     
     IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".tiff", ".tif"}
@@ -70,7 +77,12 @@ class FormatConverter:
             "yolov12": self._load_yolo,
             "yolo_seg": self._load_yolo,
             "yolo-seg": self._load_yolo,
+            "yolo-obb": self._load_yolo_obb,
+            "yolo_obb": self._load_yolo_obb,
+            "yolov8-obb": self._load_yolo_obb,
             "coco": self._load_coco,
+            "coco-panoptic": self._load_coco_panoptic,
+            "coco_panoptic": self._load_coco_panoptic,
             "pascal-voc": self._load_voc,
             "voc": self._load_voc,
             "createml": self._load_createml,
@@ -79,6 +91,10 @@ class FormatConverter:
             "labelme": self._load_labelme,
             "classification-folder": self._load_classification,
             "classification": self._load_classification,
+            "cityscapes": self._load_cityscapes,
+            "ade20k": self._load_ade20k,
+            "dota": self._load_dota,
+            "tfrecord": self._load_tfrecord,
         }
         
         loader = loaders.get(format_name, self._load_generic)
@@ -96,7 +112,12 @@ class FormatConverter:
             "yolov12": self._export_yolo,
             "yolo_seg": self._export_yolo,
             "yolo-seg": self._export_yolo,
+            "yolo-obb": self._export_yolo_obb,
+            "yolo_obb": self._export_yolo_obb,
+            "yolov8-obb": self._export_yolo_obb,
             "coco": self._export_coco,
+            "coco-panoptic": self._export_coco_panoptic,
+            "coco_panoptic": self._export_coco_panoptic,
             "pascal-voc": self._export_voc,
             "voc": self._export_voc,
             "createml": self._export_createml,
@@ -105,6 +126,10 @@ class FormatConverter:
             "labelme": self._export_labelme,
             "classification-folder": self._export_classification,
             "classification": self._export_classification,
+            "cityscapes": self._export_cityscapes,
+            "ade20k": self._export_ade20k,
+            "dota": self._export_dota,
+            "tfrecord": self._export_tfrecord,
         }
         
         exporter = exporters.get(format_name, self._export_yolo)
@@ -830,35 +855,868 @@ class FormatConverter:
     
     def _copy_images(self, source_path: Path, output_path: Path, data: Dict[str, Any], target_format: str):
         """Copy images to output directory"""
-        if target_format == "pascal-voc":
+        if target_format in ("pascal-voc", "voc"):
             dest_dir = output_path / "JPEGImages"
-        elif target_format == "classification-folder":
-            # Images copied to class folders
+        elif target_format in ("classification-folder", "classification"):
             for img in data["images"]:
                 if img["annotations"]:
                     class_name = img["annotations"][0].get("class_name", "unknown")
                     dest_dir = output_path / class_name
                     dest_dir.mkdir(parents=True, exist_ok=True)
-                    
                     src_file = source_path / img["path"]
                     if src_file.exists():
                         shutil.copy(src_file, dest_dir / img["filename"])
             return
+        elif target_format == "cityscapes":
+            dest_dir = output_path / "leftImg8bit" / "train" / "dataset"
         else:
             dest_dir = output_path / "images"
-        
+
         dest_dir.mkdir(parents=True, exist_ok=True)
-        
+
         for img in data["images"]:
             src_file = source_path / img["path"]
             if src_file.exists():
                 shutil.copy(src_file, dest_dir / img["filename"])
             else:
-                # Try to find the image
                 for found_file in source_path.glob(f"**/{img['filename']}"):
                     shutil.copy(found_file, dest_dir / img["filename"])
                     break
     
+    # ============== HELPER METHODS ==============
+
+    def _obb_to_bbox(self, cx: float, cy: float, w: float, h: float, angle_deg: float) -> List[float]:
+        """Convert oriented bounding box to axis-aligned bbox [x, y, w, h]"""
+        rad = math.radians(angle_deg)
+        cos_a = abs(math.cos(rad))
+        sin_a = abs(math.sin(rad))
+        new_w = w * cos_a + h * sin_a
+        new_h = w * sin_a + h * cos_a
+        return [cx - new_w / 2, cy - new_h / 2, new_w, new_h]
+
+    def _polygon_to_bbox(self, pts: List[float]) -> List[float]:
+        """Convert flat polygon coords [x1,y1,x2,y2,...] to bbox [x,y,w,h]"""
+        if not pts or len(pts) < 4:
+            return [0, 0, 0, 0]
+        xs = pts[0::2]
+        ys = pts[1::2]
+        xmin, xmax = min(xs), max(xs)
+        ymin, ymax = min(ys), max(ys)
+        return [xmin, ymin, xmax - xmin, ymax - ymin]
+
+    def _ann_to_bbox(self, ann: Dict[str, Any]) -> Optional[List[float]]:
+        """Extract an axis-aligned bbox from any annotation type"""
+        if ann.get("bbox"):
+            return ann["bbox"]
+        if ann.get("type") == "obb" and ann.get("obb"):
+            return self._obb_to_bbox(*ann["obb"])
+        if ann.get("segmentation"):
+            pts = ann["segmentation"][0] if ann["segmentation"] else []
+            return self._polygon_to_bbox(pts)
+        return None
+
+    # ============== NEW LOADERS ==============
+
+    def _load_yolo_obb(self, path: Path) -> Dict[str, Any]:
+        """Load YOLO OBB format (oriented bounding boxes)"""
+        data = {"classes": [], "images": []}
+
+        for yaml_file in list(path.glob("*.yaml")) + list(path.glob("*.yml")):
+            try:
+                with open(yaml_file) as f:
+                    config = yaml.safe_load(f)
+                    if "names" in config:
+                        data["classes"] = (list(config["names"].values())
+                                           if isinstance(config["names"], dict)
+                                           else config["names"])
+                        break
+            except Exception:
+                pass
+
+        image_dirs = ["images", "train/images", "val/images", "test/images",
+                      "images/train", "images/val", "images/test", ""]
+        visited = set()
+
+        for img_dir in image_dirs:
+            img_path = path / img_dir if img_dir else path
+            key = str(img_path.resolve()) if img_path.exists() else None
+            if key is None or key in visited:
+                continue
+            visited.add(key)
+
+            if img_dir and "images" in img_dir:
+                label_dir = img_dir.replace("images", "labels")
+            else:
+                label_dir = "labels"
+            label_path = path / label_dir
+
+            for img_file in img_path.iterdir():
+                if img_file.suffix.lower() not in self.IMAGE_EXTENSIONS:
+                    continue
+                try:
+                    with Image.open(img_file) as im:
+                        width, height = im.size
+                except Exception:
+                    width, height = 0, 0
+
+                image_data = {
+                    "id": img_file.stem,
+                    "filename": img_file.name,
+                    "path": str(img_file.relative_to(path)),
+                    "width": width,
+                    "height": height,
+                    "annotations": [],
+                }
+
+                label_file = label_path / f"{img_file.stem}.txt"
+                if label_file.exists():
+                    with open(label_file) as f:
+                        for line in f:
+                            parts = line.strip().split()
+                            if len(parts) < 2:
+                                continue
+                            class_id = int(parts[0])
+                            cname = (data["classes"][class_id]
+                                     if class_id < len(data["classes"])
+                                     else f"class_{class_id}")
+                            vals = [float(v) for v in parts[1:]]
+
+                            if len(vals) == 5:
+                                # class_id cx cy w h angle
+                                cx = vals[0] * width
+                                cy = vals[1] * height
+                                w = vals[2] * width
+                                h = vals[3] * height
+                                angle = vals[4]
+                                image_data["annotations"].append({
+                                    "type": "obb",
+                                    "class_id": class_id,
+                                    "class_name": cname,
+                                    "obb": [cx, cy, w, h, angle],
+                                    "bbox": self._obb_to_bbox(cx, cy, w, h, angle),
+                                })
+                            elif len(vals) == 8:
+                                # class_id x1 y1 x2 y2 x3 y3 x4 y4 (normalized)
+                                abs_pts = []
+                                for i in range(0, 8, 2):
+                                    abs_pts.append(vals[i] * width)
+                                    abs_pts.append(vals[i + 1] * height)
+                                image_data["annotations"].append({
+                                    "type": "polygon",
+                                    "class_id": class_id,
+                                    "class_name": cname,
+                                    "segmentation": [abs_pts],
+                                    "bbox": self._polygon_to_bbox(abs_pts),
+                                })
+
+                data["images"].append(image_data)
+
+        return data
+
+    def _load_coco_panoptic(self, path: Path) -> Dict[str, Any]:
+        """Load COCO Panoptic format"""
+        data = {"classes": [], "images": []}
+
+        json_files = (list(path.glob("annotations/panoptic_*.json"))
+                      + list(path.glob("panoptic_*.json")))
+        if not json_files:
+            json_files = list(path.glob("annotations/*.json"))
+
+        for json_file in json_files:
+            try:
+                with open(json_file) as f:
+                    pan_data = json.load(f)
+
+                if "categories" not in pan_data:
+                    continue
+
+                cat_map: Dict[int, int] = {}
+                for cat in pan_data["categories"]:
+                    cat_map[cat["id"]] = len(data["classes"])
+                    data["classes"].append(cat["name"])
+
+                ann_by_image: Dict[int, Any] = {}
+                for ann in pan_data.get("annotations", []):
+                    ann_by_image[ann["image_id"]] = ann
+
+                masks_dir = path / "panoptic_masks"
+
+                for img in pan_data.get("images", []):
+                    img_id = img["id"]
+                    img_entry = {
+                        "id": str(img_id),
+                        "filename": img["file_name"],
+                        "path": img["file_name"],
+                        "width": img.get("width", 0),
+                        "height": img.get("height", 0),
+                        "annotations": [],
+                    }
+
+                    ann = ann_by_image.get(img_id)
+                    if ann:
+                        mask_file = masks_dir / ann.get("file_name", "")
+                        for seg in ann.get("segments_info", []):
+                            seg_id = seg["id"]
+                            cat_idx = cat_map.get(seg["category_id"], 0)
+                            cname = (data["classes"][cat_idx]
+                                     if cat_idx < len(data["classes"])
+                                     else "unknown")
+                            bbox = seg.get("bbox", [])
+
+                            # Try to read the mask to get a tighter bbox
+                            if not bbox and mask_file.exists():
+                                try:
+                                    mask_img = Image.open(mask_file).convert("RGB")
+                                    r, g, b = (
+                                        seg_id % 256,
+                                        (seg_id // 256) % 256,
+                                        (seg_id // 65536) % 256,
+                                    )
+                                    # Find bbox of this segment in the mask
+                                    pixels = mask_img.load()
+                                    mw, mh = mask_img.size
+                                    xs, ys = [], []
+                                    for y in range(mh):
+                                        for x in range(mw):
+                                            pr, pg, pb = pixels[x, y]
+                                            if pr == r and pg == g and pb == b:
+                                                xs.append(x)
+                                                ys.append(y)
+                                    if xs:
+                                        xmin, xmax = min(xs), max(xs)
+                                        ymin, ymax = min(ys), max(ys)
+                                        bbox = [xmin, ymin, xmax - xmin, ymax - ymin]
+                                except Exception:
+                                    pass
+
+                            img_entry["annotations"].append({
+                                "type": "bbox",
+                                "class_id": cat_idx,
+                                "class_name": cname,
+                                "bbox": bbox if bbox else [0, 0, 0, 0],
+                            })
+
+                    data["images"].append(img_entry)
+
+                break  # use first valid panoptic JSON
+            except Exception:
+                pass
+
+        return data
+
+    def _load_cityscapes(self, path: Path) -> Dict[str, Any]:
+        """Load Cityscapes format (gtFine polygon JSONs)"""
+        data = {"classes": [], "images": []}
+        class_set: set = set()
+
+        for json_file in path.glob("**/*_gtFine_polygons.json"):
+            try:
+                with open(json_file) as f:
+                    cs_data = json.load(f)
+
+                img_w = cs_data.get("imgWidth", 0)
+                img_h = cs_data.get("imgHeight", 0)
+
+                # Derive image filename from JSON name
+                img_stem = json_file.name.replace("_gtFine_polygons.json", "_leftImg8bit")
+                img_filename = img_stem + ".png"
+                img_path_str = img_filename
+
+                image_data = {
+                    "id": json_file.stem,
+                    "filename": img_filename,
+                    "path": img_path_str,
+                    "width": img_w,
+                    "height": img_h,
+                    "annotations": [],
+                }
+
+                for obj in cs_data.get("objects", []):
+                    label = obj.get("label", "unknown")
+                    class_set.add(label)
+                    polygon = obj.get("polygon", [])
+                    if polygon:
+                        flat = []
+                        for pt in polygon:
+                            flat.extend(pt)
+                        image_data["annotations"].append({
+                            "type": "polygon",
+                            "class_name": label,
+                            "segmentation": [flat],
+                            "bbox": self._polygon_to_bbox(flat),
+                        })
+
+                data["images"].append(image_data)
+            except Exception:
+                pass
+
+        data["classes"] = sorted(class_set)
+        class_to_id = {n: i for i, n in enumerate(data["classes"])}
+        for img in data["images"]:
+            for ann in img["annotations"]:
+                ann["class_id"] = class_to_id.get(ann.get("class_name", ""), 0)
+
+        return data
+
+    def _load_ade20k(self, path: Path) -> Dict[str, Any]:
+        """Load ADE20K segmentation format (PNG masks, pixel = class ID)"""
+        data = {"classes": [], "images": []}
+        class_ids_seen: set = set()
+
+        ann_dir = path / "annotations"
+        if not ann_dir.exists():
+            ann_dir = path
+
+        img_dir = path / "images"
+        if not img_dir.exists():
+            img_dir = path
+
+        # Build stem → annotation file map
+        ann_map: Dict[str, Path] = {}
+        for ann_file in ann_dir.glob("**/*.png"):
+            ann_map[ann_file.stem] = ann_file
+
+        for img_file in img_dir.glob("**/*"):
+            if img_file.suffix.lower() not in self.IMAGE_EXTENSIONS:
+                continue
+
+            ann_file = ann_map.get(img_file.stem)
+            try:
+                with Image.open(img_file) as im:
+                    width, height = im.size
+            except Exception:
+                width, height = 0, 0
+
+            image_data = {
+                "id": img_file.stem,
+                "filename": img_file.name,
+                "path": str(img_file.relative_to(path)),
+                "width": width,
+                "height": height,
+                "annotations": [],
+            }
+
+            if ann_file and ann_file.exists():
+                try:
+                    mask = Image.open(ann_file).convert("L")
+                    unique_vals = set(mask.getdata()) - {0}
+                    for cls_id in sorted(unique_vals):
+                        class_ids_seen.add(cls_id)
+                        binary = mask.point(lambda p, c=cls_id: 255 if p == c else 0)
+                        bbox = binary.getbbox()
+                        if bbox:
+                            x, y, x2, y2 = bbox
+                            image_data["annotations"].append({
+                                "type": "bbox",
+                                "class_id": int(cls_id),
+                                "class_name": f"class_{cls_id}",
+                                "bbox": [x, y, x2 - x, y2 - y],
+                            })
+                except Exception:
+                    pass
+
+            data["images"].append(image_data)
+
+        # Build class list from seen IDs
+        all_ids = sorted(class_ids_seen)
+        data["classes"] = [f"class_{i}" for i in all_ids]
+        id_to_idx = {cid: idx for idx, cid in enumerate(all_ids)}
+        for img in data["images"]:
+            for ann in img["annotations"]:
+                raw_id = ann["class_id"]
+                ann["class_id"] = id_to_idx.get(raw_id, raw_id)
+
+        return data
+
+    def _load_dota(self, path: Path) -> Dict[str, Any]:
+        """Load DOTA format (labelTxt/ directory, absolute quad coordinates)"""
+        data = {"classes": [], "images": []}
+        class_set: set = set()
+
+        label_dir = path / "labelTxt"
+        if not label_dir.exists():
+            label_dir = path
+
+        img_dir = path / "images"
+        if not img_dir.exists():
+            img_dir = path
+
+        # Build stem → image file map
+        img_map: Dict[str, Path] = {}
+        for ext in self.IMAGE_EXTENSIONS:
+            for img_file in img_dir.glob(f"*{ext}"):
+                img_map[img_file.stem] = img_file
+
+        for txt_file in label_dir.glob("*.txt"):
+            img_file = img_map.get(txt_file.stem)
+            if img_file:
+                try:
+                    with Image.open(img_file) as im:
+                        width, height = im.size
+                except Exception:
+                    width, height = 0, 0
+                img_filename = img_file.name
+                img_path_str = str(img_file.relative_to(path))
+            else:
+                width, height = 0, 0
+                img_filename = txt_file.stem + ".png"
+                img_path_str = img_filename
+
+            image_data = {
+                "id": txt_file.stem,
+                "filename": img_filename,
+                "path": img_path_str,
+                "width": width,
+                "height": height,
+                "annotations": [],
+            }
+
+            try:
+                with open(txt_file) as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("imagesource") or line.startswith("gsd"):
+                            continue
+                        parts = line.split()
+                        if len(parts) < 9:
+                            continue
+                        try:
+                            coords = [float(v) for v in parts[:8]]
+                            class_name = parts[8]
+                            class_set.add(class_name)
+                            image_data["annotations"].append({
+                                "type": "polygon",
+                                "class_name": class_name,
+                                "segmentation": [coords],
+                                "bbox": self._polygon_to_bbox(coords),
+                            })
+                        except (ValueError, IndexError):
+                            continue
+            except Exception:
+                pass
+
+            data["images"].append(image_data)
+
+        data["classes"] = sorted(class_set)
+        class_to_id = {n: i for i, n in enumerate(data["classes"])}
+        for img in data["images"]:
+            for ann in img["annotations"]:
+                ann["class_id"] = class_to_id.get(ann.get("class_name", ""), 0)
+
+        return data
+
+    def _load_tfrecord(self, path: Path) -> Dict[str, Any]:
+        """Load TFRecord format (requires tensorflow)"""
+        try:
+            import tensorflow as tf  # type: ignore
+        except ImportError:
+            raise RuntimeError(
+                "TFRecord format requires TensorFlow. "
+                "Install it with: pip install tensorflow"
+            )
+
+        data = {"classes": [], "images": []}
+        class_set: set = set()
+
+        # Load label map if present
+        label_map: Dict[int, str] = {}
+        for pbtxt in path.glob("*.pbtxt"):
+            try:
+                content = pbtxt.read_text()
+                import re
+                items = re.findall(
+                    r"item\s*\{[^}]*id:\s*(\d+)[^}]*name:\s*['\"]([^'\"]+)['\"]",
+                    content,
+                    re.DOTALL,
+                )
+                for item_id, item_name in items:
+                    label_map[int(item_id)] = item_name
+            except Exception:
+                pass
+
+        for record_file in path.glob("*.record"):
+            try:
+                dataset = tf.data.TFRecordDataset(str(record_file))
+                for raw_record in dataset:
+                    example = tf.train.Example()
+                    example.ParseFromString(raw_record.numpy())
+                    feat = example.features.feature
+
+                    def _get(key, default=None):
+                        if key in feat:
+                            f = feat[key]
+                            if f.HasField("bytes_list"):
+                                return f.bytes_list.value
+                            if f.HasField("float_list"):
+                                return list(f.float_list.value)
+                            if f.HasField("int64_list"):
+                                return list(f.int64_list.value)
+                        return default
+
+                    filename_bytes = _get("image/filename") or _get("image/source_id")
+                    filename = (filename_bytes[0].decode("utf-8")
+                                if filename_bytes else "unknown.jpg")
+
+                    widths = _get("image/width") or [0]
+                    heights = _get("image/height") or [0]
+                    w = int(widths[0]) if widths else 0
+                    h = int(heights[0]) if heights else 0
+
+                    xmins = _get("image/object/bbox/xmin") or []
+                    xmaxs = _get("image/object/bbox/xmax") or []
+                    ymins = _get("image/object/bbox/ymin") or []
+                    ymaxs = _get("image/object/bbox/ymax") or []
+                    labels = _get("image/object/class/label") or []
+                    label_texts = _get("image/object/class/text") or []
+
+                    annotations = []
+                    for i in range(len(xmins)):
+                        class_id = int(labels[i]) if i < len(labels) else 0
+                        class_name = (label_texts[i].decode("utf-8")
+                                      if i < len(label_texts)
+                                      else label_map.get(class_id, f"class_{class_id}"))
+                        class_set.add(class_name)
+                        x1 = float(xmins[i]) * w
+                        y1 = float(ymins[i]) * h
+                        x2 = float(xmaxs[i]) * w
+                        y2 = float(ymaxs[i]) * h
+                        annotations.append({
+                            "type": "bbox",
+                            "class_id": class_id,
+                            "class_name": class_name,
+                            "bbox": [x1, y1, x2 - x1, y2 - y1],
+                        })
+
+                    data["images"].append({
+                        "id": Path(filename).stem,
+                        "filename": filename,
+                        "path": filename,
+                        "width": w,
+                        "height": h,
+                        "annotations": annotations,
+                    })
+            except Exception:
+                pass
+
+        data["classes"] = sorted(class_set)
+        class_to_id = {n: i for i, n in enumerate(data["classes"])}
+        for img in data["images"]:
+            for ann in img["annotations"]:
+                ann["class_id"] = class_to_id.get(ann.get("class_name", ""), ann.get("class_id", 0))
+
+        return data
+
+    # ============== NEW EXPORTERS ==============
+
+    def _export_yolo_obb(self, data: Dict[str, Any], output_path: Path):
+        """Export to YOLO OBB format"""
+        images_dir = output_path / "images"
+        labels_dir = output_path / "labels"
+        images_dir.mkdir(parents=True, exist_ok=True)
+        labels_dir.mkdir(parents=True, exist_ok=True)
+
+        yaml_data = {
+            "path": str(output_path.absolute()),
+            "train": "images",
+            "val": "images",
+            "names": {i: n for i, n in enumerate(data["classes"])},
+        }
+        with open(output_path / "data.yaml", "w") as f:
+            yaml.dump(yaml_data, f, default_flow_style=False)
+
+        class_to_id = {n: i for i, n in enumerate(data["classes"])}
+
+        for img in data["images"]:
+            if not img["annotations"]:
+                continue
+            width = img.get("width", 1) or 1
+            height = img.get("height", 1) or 1
+
+            label_file = labels_dir / f"{img['id']}.txt"
+            with open(label_file, "w") as f:
+                for ann in img["annotations"]:
+                    cid = ann.get("class_id", class_to_id.get(ann.get("class_name", ""), 0))
+
+                    if ann.get("type") == "obb" and ann.get("obb"):
+                        cx, cy, w, h, angle = ann["obb"]
+                        f.write(
+                            f"{cid} {cx/width:.6f} {cy/height:.6f} "
+                            f"{w/width:.6f} {h/height:.6f} {angle:.4f}\n"
+                        )
+                    elif ann.get("type") == "polygon" and ann.get("segmentation"):
+                        pts = ann["segmentation"][0]
+                        if len(pts) >= 8:
+                            quad = pts[:8]
+                            norm = []
+                            for i in range(0, 8, 2):
+                                norm.append(quad[i] / width)
+                                norm.append(quad[i + 1] / height)
+                            f.write(f"{cid} " + " ".join(f"{v:.6f}" for v in norm) + "\n")
+                    elif ann.get("bbox"):
+                        bbox = ann["bbox"]
+                        cx = (bbox[0] + bbox[2] / 2) / width
+                        cy = (bbox[1] + bbox[3] / 2) / height
+                        w = bbox[2] / width
+                        h = bbox[3] / height
+                        f.write(f"{cid} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f} 0.0000\n")
+
+    def _export_coco_panoptic(self, data: Dict[str, Any], output_path: Path):
+        """Export to COCO Panoptic format"""
+        images_dir = output_path / "images"
+        ann_dir = output_path / "annotations"
+        masks_dir = output_path / "panoptic_masks"
+        images_dir.mkdir(parents=True, exist_ok=True)
+        ann_dir.mkdir(parents=True, exist_ok=True)
+        masks_dir.mkdir(parents=True, exist_ok=True)
+
+        categories = [
+            {"id": i, "name": n, "supercategory": "none", "isthing": 1}
+            for i, n in enumerate(data["classes"])
+        ]
+        class_to_id = {n: i for i, n in enumerate(data["classes"])}
+
+        pan_images = []
+        pan_annotations = []
+
+        for img_idx, img in enumerate(data["images"]):
+            img_id = img_idx + 1
+            w = img.get("width", 0) or 1
+            h = img.get("height", 0) or 1
+            pan_images.append({
+                "id": img_id,
+                "file_name": img["filename"],
+                "width": w,
+                "height": h,
+            })
+
+            mask_name = f"{Path(img['filename']).stem}.png"
+            mask_img = Image.new("RGB", (w, h), (0, 0, 0))
+            draw = ImageDraw.Draw(mask_img)
+
+            segments_info = []
+            for seg_idx, ann in enumerate(img["annotations"]):
+                seg_id = seg_idx + 1
+                cid = ann.get("class_id", class_to_id.get(ann.get("class_name", ""), 0))
+                r = seg_id % 256
+                g = (seg_id // 256) % 256
+                b = (seg_id // 65536) % 256
+                color = (r, g, b)
+
+                bbox = self._ann_to_bbox(ann) or [0, 0, 0, 0]
+                area = int(bbox[2] * bbox[3])
+
+                # Draw the segment in the mask
+                if ann.get("type") == "polygon" and ann.get("segmentation"):
+                    pts = ann["segmentation"][0]
+                    poly = [(pts[i], pts[i + 1]) for i in range(0, len(pts) - 1, 2)]
+                    if len(poly) >= 3:
+                        draw.polygon(poly, fill=color)
+                else:
+                    x, y, bw, bh = [int(v) for v in bbox]
+                    draw.rectangle([x, y, x + bw, y + bh], fill=color)
+
+                segments_info.append({
+                    "id": seg_id,
+                    "category_id": cid,
+                    "area": area,
+                    "bbox": [int(v) for v in bbox],
+                    "iscrowd": 0,
+                })
+
+            mask_img.save(masks_dir / mask_name)
+            pan_annotations.append({
+                "image_id": img_id,
+                "file_name": mask_name,
+                "segments_info": segments_info,
+            })
+
+        panoptic_json = {
+            "images": pan_images,
+            "annotations": pan_annotations,
+            "categories": categories,
+        }
+        with open(ann_dir / "panoptic_train.json", "w") as f:
+            json.dump(panoptic_json, f, indent=2)
+
+    def _export_cityscapes(self, data: Dict[str, Any], output_path: Path):
+        """Export to Cityscapes format"""
+        city = "dataset"
+        gt_dir = output_path / "gtFine" / "train" / city
+        gt_dir.mkdir(parents=True, exist_ok=True)
+
+        class_to_id = {n: i for i, n in enumerate(data["classes"])}
+
+        for img in data["images"]:
+            stem = img["id"]
+            cs_name = f"{stem}_gtFine_polygons.json"
+
+            objects = []
+            for ann in img["annotations"]:
+                cname = ann.get("class_name", "unlabeled")
+                if ann.get("type") == "polygon" and ann.get("segmentation"):
+                    pts = ann["segmentation"][0]
+                    polygon = [[pts[i], pts[i + 1]] for i in range(0, len(pts) - 1, 2)]
+                elif ann.get("bbox"):
+                    x, y, w, h = ann["bbox"]
+                    polygon = [[x, y], [x + w, y], [x + w, y + h], [x, y + h]]
+                else:
+                    continue
+                objects.append({"label": cname, "polygon": polygon})
+
+            cs_json = {
+                "imgHeight": img.get("height", 0),
+                "imgWidth": img.get("width", 0),
+                "objects": objects,
+            }
+            with open(gt_dir / cs_name, "w") as f:
+                json.dump(cs_json, f, indent=2)
+
+    def _export_ade20k(self, data: Dict[str, Any], output_path: Path):
+        """Export to ADE20K format (grayscale PNG masks)"""
+        images_dir = output_path / "images"
+        ann_dir = output_path / "annotations"
+        images_dir.mkdir(parents=True, exist_ok=True)
+        ann_dir.mkdir(parents=True, exist_ok=True)
+
+        class_to_id = {n: i + 1 for i, n in enumerate(data["classes"])}  # ADE20K starts at 1
+
+        for img in data["images"]:
+            w = img.get("width", 1) or 1
+            h = img.get("height", 1) or 1
+            mask = Image.new("L", (w, h), 0)
+            draw = ImageDraw.Draw(mask)
+
+            for ann in img["annotations"]:
+                cname = ann.get("class_name", "")
+                pixel_val = class_to_id.get(cname, ann.get("class_id", 0) + 1)
+                pixel_val = min(pixel_val, 255)
+
+                if ann.get("type") == "polygon" and ann.get("segmentation"):
+                    pts = ann["segmentation"][0]
+                    poly = [(pts[i], pts[i + 1]) for i in range(0, len(pts) - 1, 2)]
+                    if len(poly) >= 3:
+                        draw.polygon(poly, fill=pixel_val)
+                elif ann.get("bbox"):
+                    x, y, bw, bh = [int(v) for v in ann["bbox"]]
+                    draw.rectangle([x, y, x + bw, y + bh], fill=pixel_val)
+
+            mask.save(ann_dir / f"{img['id']}.png")
+
+    def _export_dota(self, data: Dict[str, Any], output_path: Path):
+        """Export to DOTA format (absolute quad coordinates in labelTxt/)"""
+        images_dir = output_path / "images"
+        label_dir = output_path / "labelTxt"
+        images_dir.mkdir(parents=True, exist_ok=True)
+        label_dir.mkdir(parents=True, exist_ok=True)
+
+        for img in data["images"]:
+            w = img.get("width", 1) or 1
+            h = img.get("height", 1) or 1
+            lines = []
+
+            for ann in img["annotations"]:
+                cname = ann.get("class_name", "unknown")
+
+                if ann.get("type") == "polygon" and ann.get("segmentation"):
+                    pts = ann["segmentation"][0]
+                    if len(pts) >= 8:
+                        quad = pts[:8]
+                    else:
+                        # Pad to 8 values by repeating last point
+                        quad = pts + pts[-2:] * ((8 - len(pts)) // 2 + 1)
+                        quad = quad[:8]
+                elif ann.get("type") == "obb" and ann.get("obb"):
+                    cx, cy, bw, bh, angle = ann["obb"]
+                    rad = math.radians(angle)
+                    cos_a, sin_a = math.cos(rad), math.sin(rad)
+                    hw, hh = bw / 2, bh / 2
+                    corners = [
+                        (cx + cos_a * hw - sin_a * hh, cy + sin_a * hw + cos_a * hh),
+                        (cx - cos_a * hw - sin_a * hh, cy - sin_a * hw + cos_a * hh),
+                        (cx - cos_a * hw + sin_a * hh, cy - sin_a * hw - cos_a * hh),
+                        (cx + cos_a * hw + sin_a * hh, cy + sin_a * hw - cos_a * hh),
+                    ]
+                    quad = [v for corner in corners for v in corner]
+                elif ann.get("bbox"):
+                    x, y, bw, bh = ann["bbox"]
+                    quad = [x, y, x + bw, y, x + bw, y + bh, x, y + bh]
+                else:
+                    continue
+
+                coord_str = " ".join(f"{v:.2f}" for v in quad)
+                lines.append(f"{coord_str} {cname} 0")
+
+            with open(label_dir / f"{img['id']}.txt", "w") as f:
+                f.write("\n".join(lines))
+
+    def _export_tfrecord(self, data: Dict[str, Any], output_path: Path):
+        """Export to TFRecord format (requires tensorflow)"""
+        try:
+            import tensorflow as tf  # type: ignore
+        except ImportError:
+            raise RuntimeError(
+                "TFRecord export requires TensorFlow. "
+                "Install it with: pip install tensorflow"
+            )
+
+        output_path.mkdir(parents=True, exist_ok=True)
+
+        # Write label map
+        label_map_lines = []
+        for i, name in enumerate(data["classes"]):
+            label_map_lines.append(
+                f"item {{\n  id: {i}\n  name: '{name}'\n}}"
+            )
+        with open(output_path / "label_map.pbtxt", "w") as f:
+            f.write("\n\n".join(label_map_lines))
+
+        class_to_id = {n: i for i, n in enumerate(data["classes"])}
+        writer = tf.io.TFRecordWriter(str(output_path / "train.record"))
+
+        for img in data["images"]:
+            w = img.get("width", 0)
+            h = img.get("height", 0)
+            xmins, xmaxs, ymins, ymaxs, labels, label_texts = [], [], [], [], [], []
+
+            for ann in img["annotations"]:
+                bbox = self._ann_to_bbox(ann)
+                if not bbox:
+                    continue
+                x, y, bw, bh = bbox
+                xmins.append(max(0.0, x / w) if w else 0.0)
+                ymins.append(max(0.0, y / h) if h else 0.0)
+                xmaxs.append(min(1.0, (x + bw) / w) if w else 0.0)
+                ymaxs.append(min(1.0, (y + bh) / h) if h else 0.0)
+                cname = ann.get("class_name", "unknown")
+                cid = ann.get("class_id", class_to_id.get(cname, 0))
+                labels.append(cid)
+                label_texts.append(cname.encode("utf-8"))
+
+            feature = {
+                "image/height": tf.train.Feature(int64_list=tf.train.Int64List(value=[h])),
+                "image/width": tf.train.Feature(int64_list=tf.train.Int64List(value=[w])),
+                "image/filename": tf.train.Feature(
+                    bytes_list=tf.train.BytesList(value=[img["filename"].encode("utf-8")])
+                ),
+                "image/source_id": tf.train.Feature(
+                    bytes_list=tf.train.BytesList(value=[img["id"].encode("utf-8")])
+                ),
+                "image/object/bbox/xmin": tf.train.Feature(float_list=tf.train.FloatList(value=xmins)),
+                "image/object/bbox/xmax": tf.train.Feature(float_list=tf.train.FloatList(value=xmaxs)),
+                "image/object/bbox/ymin": tf.train.Feature(float_list=tf.train.FloatList(value=ymins)),
+                "image/object/bbox/ymax": tf.train.Feature(float_list=tf.train.FloatList(value=ymaxs)),
+                "image/object/class/label": tf.train.Feature(
+                    int64_list=tf.train.Int64List(value=labels)
+                ),
+                "image/object/class/text": tf.train.Feature(
+                    bytes_list=tf.train.BytesList(value=label_texts)
+                ),
+            }
+            example = tf.train.Example(features=tf.train.Features(feature=feature))
+            writer.write(example.SerializeToString())
+
+        writer.close()
+
     def update_data_yaml(
         self, 
         dataset_path: Path, 

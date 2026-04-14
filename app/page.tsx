@@ -1,7 +1,7 @@
 'use client'
 
 import { useState, useCallback, useEffect } from 'react'
-import { Loader2, AlertTriangle, X } from 'lucide-react'
+import { Loader2, AlertTriangle, X, Database } from 'lucide-react'
 import { Sidebar } from '@/components/sidebar'
 import { DatasetsView } from '@/components/datasets-view'
 import { DashboardView } from '@/components/dashboard-view'
@@ -68,13 +68,105 @@ export interface Annotation {
 // Shared image cache so tab-switches don't reload
 export type ImageCache = Record<string, ImageData[]>
 
+// All valid view IDs — used to validate URL path segments
+const VALID_VIEWS = new Set<ViewType>([
+  'datasets', 'dashboard', 'gallery', 'sorting', 'annotate', 'classes',
+  'augmentation', 'video-extraction', 'split', 'convert', 'merge',
+  'training', 'models', 'batch-jobs', 'health', 'compare', 'snapshots',
+  'yaml-wizard', 'settings', 'duplicate-detection',
+])
+
+// Views that require a dataset to be selected before they're useful
+const DATASET_REQUIRED_VIEWS = new Set<ViewType>([
+  'dashboard', 'gallery', 'sorting', 'annotate', 'classes',
+  'augmentation', 'video-extraction', 'split', 'health',
+  'snapshots', 'yaml-wizard', 'duplicate-detection',
+])
+
+// Inline dataset picker shown when a view needs a dataset but none is selected
+function DatasetRequiredGuard({
+  datasets,
+  selectedDataset,
+  onSelectDataset,
+  children,
+}: {
+  datasets: Dataset[]
+  selectedDataset: Dataset | null
+  onSelectDataset: (d: Dataset) => void
+  children: React.ReactNode
+}) {
+  if (selectedDataset) return <>{children}</>
+
+  return (
+    <div className="flex flex-col items-center justify-center h-full gap-6 p-8">
+      <div className="flex flex-col items-center gap-2 text-center">
+        <Database className="w-10 h-10 text-muted-foreground/40 mb-1" />
+        <h2 className="text-base font-semibold text-foreground">No dataset selected</h2>
+        <p className="text-sm text-muted-foreground max-w-xs">
+          {datasets.length === 0
+            ? 'No datasets are loaded yet. Go to Datasets to load one first.'
+            : 'Pick a dataset below to continue.'}
+        </p>
+      </div>
+      {datasets.length > 0 && (
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 w-full max-w-2xl">
+          {datasets.map((d) => (
+            <button
+              key={d.id}
+              onClick={() => onSelectDataset(d)}
+              className="text-left p-3.5 rounded-xl border border-border bg-card hover:bg-accent hover:border-primary/40 transition-all duration-150 group"
+            >
+              <p className="text-sm font-semibold text-foreground truncate group-hover:text-primary transition-colors">
+                {d.name}
+              </p>
+              <div className="flex items-center gap-2 mt-1.5">
+                <span className="text-[10px] px-1.5 py-0.5 bg-muted text-muted-foreground rounded font-mono">
+                  {d.format?.toUpperCase()}
+                </span>
+                <span className="text-[11px] text-muted-foreground">
+                  {d.num_images?.toLocaleString()} images
+                </span>
+              </div>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
 export default function Home() {
-  const [activeView, setActiveView] = useState<ViewType>('datasets')
+  // Derive initial view from URL path, fallback to 'datasets'
+  const getInitialView = (): ViewType => {
+    if (typeof window === 'undefined') return 'datasets'
+    const segment = window.location.pathname.replace(/^\//, '') as ViewType
+    return VALID_VIEWS.has(segment) ? segment : 'datasets'
+  }
+
+  const [activeView, setActiveViewState] = useState<ViewType>(getInitialView)
   const [datasets, setDatasets] = useState<Dataset[]>([])
   const [selectedDataset, setSelectedDataset] = useState<Dataset | null>(null)
   const [imageCache, setImageCache] = useState<ImageCache>({})
   const [annotateInitialImageId, setAnnotateInitialImageId] = useState<string | null>(null)
   const [gpuStatus, setGpuStatus] = useState<{ state: string; message: string } | null>(null)
+
+  // Sync activeView when user navigates with browser back/forward buttons
+  useEffect(() => {
+    const handlePopState = () => {
+      const segment = window.location.pathname.replace(/^\//, '') as ViewType
+      if (VALID_VIEWS.has(segment)) {
+        setActiveViewState(segment)
+      }
+    }
+    window.addEventListener('popstate', handlePopState)
+    return () => window.removeEventListener('popstate', handlePopState)
+  }, [])
+
+  // Navigate to a view — updates React state AND the browser URL without remounting
+  const setActiveView = useCallback((view: ViewType) => {
+    setActiveViewState(view)
+    window.history.pushState(null, '', `/${view}`)
+  }, [])
 
   // apiUrl now comes from the shared settings context
   const { settings } = useSettings()
@@ -121,9 +213,10 @@ export default function Home() {
   }
 
   const renderView = () => {
+    let viewNode: React.ReactNode = null
     switch (activeView) {
       case 'datasets':
-        return (
+        viewNode = (
           <DatasetsView
             datasets={datasets}
             setDatasets={setDatasets}
@@ -133,8 +226,9 @@ export default function Home() {
             apiUrl={apiUrl}
           />
         )
+        break
       case 'dashboard':
-        return (
+        viewNode = (
           <DashboardView
             datasets={datasets}
             selectedDataset={selectedDataset}
@@ -143,8 +237,9 @@ export default function Home() {
             apiUrl={apiUrl}
           />
         )
+        break
       case 'gallery':
-        return (
+        viewNode = (
           <GalleryView
             selectedDataset={selectedDataset}
             apiUrl={apiUrl}
@@ -153,8 +248,9 @@ export default function Home() {
             onOpenAnnotator={(imageId: string) => { setAnnotateInitialImageId(imageId); setActiveView('annotate') }}
           />
         )
+        break
       case 'health':
-        return (
+        viewNode = (
           <HealthView
             selectedDataset={selectedDataset}
             apiUrl={apiUrl}
@@ -162,15 +258,17 @@ export default function Home() {
             updateImageCache={updateImageCache}
           />
         )
+        break
       case 'compare':
-        return (
+        viewNode = (
           <CompareView
             datasets={datasets}
             apiUrl={apiUrl}
           />
         )
+        break
       case 'snapshots':
-        return (
+        viewNode = (
           <SnapshotView
             selectedDataset={selectedDataset}
             datasets={datasets}
@@ -178,8 +276,9 @@ export default function Home() {
             apiUrl={apiUrl}
           />
         )
+        break
       case 'sorting':
-        return (
+        viewNode = (
           <SortingView
             selectedDataset={selectedDataset}
             apiUrl={apiUrl}
@@ -187,15 +286,17 @@ export default function Home() {
             updateImageCache={updateImageCache}
           />
         )
+        break
       case 'duplicate-detection':
-        return (
+        viewNode = (
           <DuplicateDetectionView
             selectedDataset={selectedDataset}
             apiUrl={apiUrl}
           />
         )
+        break
       case 'annotate':
-        return (
+        viewNode = (
           <AnnotationView
             selectedDataset={selectedDataset}
             apiUrl={apiUrl}
@@ -205,8 +306,9 @@ export default function Home() {
             onInitialImageConsumed={() => setAnnotateInitialImageId(null)}
           />
         )
+        break
       case 'classes':
-        return (
+        viewNode = (
           <ClassManagementView
             selectedDataset={selectedDataset}
             datasets={datasets}
@@ -214,8 +316,9 @@ export default function Home() {
             apiUrl={apiUrl}
           />
         )
+        break
       case 'augmentation':
-        return (
+        viewNode = (
           <AugmentationView
             selectedDataset={selectedDataset}
             datasets={datasets}
@@ -223,8 +326,9 @@ export default function Home() {
             apiUrl={apiUrl}
           />
         )
+        break
       case 'video-extraction':
-        return (
+        viewNode = (
           <VideoExtractionView
             selectedDataset={selectedDataset}
             datasets={datasets}
@@ -232,8 +336,9 @@ export default function Home() {
             apiUrl={apiUrl}
           />
         )
+        break
       case 'split':
-        return (
+        viewNode = (
           <SplitView
             selectedDataset={selectedDataset}
             datasets={datasets}
@@ -241,55 +346,76 @@ export default function Home() {
             apiUrl={apiUrl}
           />
         )
+        break
       case 'convert':
-        return (
+        viewNode = (
           <ConvertView
             datasets={datasets}
             setDatasets={setDatasets}
             apiUrl={apiUrl}
           />
         )
+        break
       case 'merge':
-        return (
+        viewNode = (
           <MergeView
             datasets={datasets}
             setDatasets={setDatasets}
             apiUrl={apiUrl}
           />
         )
+        break
       case 'training':
-        return (
+        viewNode = (
           <TrainingView
             datasets={datasets}
             apiUrl={apiUrl}
           />
         )
+        break
       case 'models':
-        return (
+        viewNode = (
           <ModelsView
             apiUrl={apiUrl}
           />
         )
+        break
       case 'batch-jobs':
-        return (
+        viewNode = (
           <BatchJobsView
             datasets={datasets}
             selectedDataset={selectedDataset}
             apiUrl={apiUrl}
           />
         )
+        break
       case 'yaml-wizard':
-        return (
+        viewNode = (
           <YamlWizardView
             selectedDataset={selectedDataset}
             apiUrl={apiUrl}
           />
         )
+        break
       case 'settings':
         return <SettingsView />
       default:
         return null
     }
+
+    // Wrap views that require a dataset with the inline dataset picker
+    if (DATASET_REQUIRED_VIEWS.has(activeView)) {
+      return (
+        <DatasetRequiredGuard
+          datasets={datasets}
+          selectedDataset={selectedDataset}
+          onSelectDataset={handleSelectDataset}
+        >
+          {viewNode}
+        </DatasetRequiredGuard>
+      )
+    }
+    return viewNode
   }
 
   return (

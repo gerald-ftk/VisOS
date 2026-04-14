@@ -14,6 +14,7 @@ import json
 import shutil
 import uuid
 import random
+import yaml
 from pathlib import Path
 from datetime import datetime
 from contextlib import asynccontextmanager
@@ -28,7 +29,9 @@ from video_utils import VideoFrameExtractor, DuplicateDetector, CLIPEmbeddingMan
 from augmentation import DatasetAugmenter
 
 # Configuration - must be defined before functions that use them
-WORKSPACE_DIR = Path("./workspace")
+# Use path relative to this file so models always land in backend/workspace/
+# regardless of the process working directory.
+WORKSPACE_DIR = Path(__file__).parent / "workspace"
 DATASETS_DIR = WORKSPACE_DIR / "datasets"
 MODELS_DIR = WORKSPACE_DIR / "models"
 EXPORTS_DIR = WORKSPACE_DIR / "exports"
@@ -362,6 +365,7 @@ class ClassExtractRequest(BaseModel):
     dataset_id: str
     classes_to_extract: List[str]
     output_name: str
+    output_format: Optional[str] = None  # If None, same format as source
 
 
 class ClassDeleteRequest(BaseModel):
@@ -375,14 +379,21 @@ class ClassMergeRequest(BaseModel):
     target_class: str
 
 
-class SplitRequest(BaseModel):
+class ClassRenameRequest(BaseModel):
     dataset_id: str
+    old_name: str
+    new_name: str
+
+
+class SplitRequest(BaseModel):
+    dataset_id: Optional[str] = None
     train_ratio: float = 0.7
     val_ratio: float = 0.2
     test_ratio: float = 0.1
     output_name: Optional[str] = None
     shuffle: bool = True
     seed: Optional[int] = None
+    stratify: bool = False
 
 
 class AugmentationConfig(BaseModel):
@@ -490,15 +501,37 @@ async def get_dataset(dataset_id: str):
 
 
 @app.get("/api/datasets/{dataset_id}/stats")
-async def get_dataset_stats(dataset_id: str):
-    """Get detailed statistics for a dataset including class distribution, splits, etc."""
+async def get_dataset_stats(dataset_id: str, force_refresh: bool = False):
+    """Get detailed statistics for a dataset including class distribution, splits, etc.
+    
+    Stats are cached in metadata after first calculation so subsequent loads are instant.
+    Pass ?force_refresh=true to recompute from scratch.
+    """
     if dataset_id not in active_datasets:
         raise HTTPException(status_code=404, detail="Dataset not found")
-    
+
     dataset = active_datasets[dataset_id]
     dataset_path = DATASETS_DIR / dataset_id
 
-    # Calculate statistics (also re-parses to fix stale counts)
+    # Return cached stats if available and not forcing a refresh
+    cached = dataset.get("_cached_stats")
+    if cached and not force_refresh:
+        return {
+            "dataset_id": dataset_id,
+            "name": dataset["name"],
+            "format": dataset["format"],
+            "task_type": dataset.get("task_type", "detection"),
+            "total_images": dataset.get("num_images", 0),
+            "total_annotations": dataset.get("num_annotations", 0),
+            "class_distribution": cached.get("class_distribution", {}),
+            "splits": cached.get("splits", {}),
+            "image_sizes": {},
+            "avg_annotations_per_image": cached.get("avg_annotations_per_image", 0),
+            "created_at": dataset["created_at"],
+            "from_cache": True,
+        }
+
+    # Calculate statistics fresh
     stats = dataset_parser.get_dataset_details(dataset_path, dataset["format"])
 
     # If the stored metadata had stale zeros, refresh it now
@@ -506,8 +539,22 @@ async def get_dataset_stats(dataset_id: str):
         fresh = dataset_parser.parse_dataset(dataset_path, dataset["format"], dataset["name"])
         fresh["id"] = dataset_id
         active_datasets[dataset_id] = fresh
-        _save_dataset_metadata(dataset_id, fresh)
         dataset = fresh
+
+    # Persist computed stats into metadata so the next session is instant
+    cached_stats = {
+        "class_distribution": stats.get("class_distribution", {}),
+        "splits": stats.get("splits", {}),
+        "avg_annotations_per_image": stats.get("avg_annotations_per_image", 0),
+    }
+    dataset["_cached_stats"] = cached_stats
+    dataset["num_images"] = stats.get("total_images", dataset.get("num_images", 0))
+    dataset["num_annotations"] = stats.get("total_annotations", dataset.get("num_annotations", 0))
+    # Also keep classes list up to date
+    if stats.get("class_distribution"):
+        dataset["classes"] = list(stats["class_distribution"].keys())
+    active_datasets[dataset_id] = dataset
+    _save_dataset_metadata(dataset_id, dataset)
 
     return {
         "dataset_id": dataset_id,
@@ -520,7 +567,8 @@ async def get_dataset_stats(dataset_id: str):
         "splits": stats.get("splits", {}),
         "image_sizes": {},
         "avg_annotations_per_image": stats.get("avg_annotations_per_image", 0),
-        "created_at": dataset["created_at"]
+        "created_at": dataset["created_at"],
+        "from_cache": False,
     }
 
 
@@ -574,11 +622,15 @@ async def split_dataset(dataset_id: str, request: SplitRequest):
     new_info["id"] = new_dataset_id
     new_info["splits"] = split_result["splits"]
     active_datasets[new_dataset_id] = new_info
-    
+    _save_dataset_metadata(new_dataset_id, new_info)
+
     return {
-        "success": True, 
+        "success": True,
         "new_dataset": new_info,
-        "splits": split_result["splits"]
+        "splits": split_result["splits"],
+        "train_count": split_result["splits"].get("train", 0),
+        "val_count": split_result["splits"].get("val", 0),
+        "test_count": split_result["splits"].get("test", 0),
     }
 
 
@@ -589,31 +641,42 @@ async def extract_classes_to_new_dataset(dataset_id: str, request: ClassExtractR
     """Extract specific classes to a new dataset"""
     if dataset_id not in active_datasets:
         raise HTTPException(status_code=404, detail="Dataset not found")
-    
+
     dataset = active_datasets[dataset_id]
     dataset_path = DATASETS_DIR / dataset_id
-    
-    # Validate classes exist
-    for cls in request.classes_to_extract:
-        if cls not in dataset["classes"]:
-            raise HTTPException(status_code=400, detail=f"Class '{cls}' not found in dataset")
-    
-    # Create new dataset
+    source_format = dataset["format"]
+
+    # Create new dataset directory
     new_dataset_id = str(uuid.uuid4())
     output_path = DATASETS_DIR / new_dataset_id
-    
+
     extraction_result = annotation_manager.extract_classes(
         dataset_path,
         output_path,
-        dataset["format"],
+        source_format,
         request.classes_to_extract
     )
-    
+
+    # Optionally convert to a different output format
+    target_format = request.output_format or source_format
+    if request.output_format and request.output_format != source_format:
+        converted_id = str(uuid.uuid4())
+        converted_path = DATASETS_DIR / converted_id
+        try:
+            format_converter.convert(output_path, converted_path, source_format, request.output_format)
+            shutil.rmtree(output_path, ignore_errors=True)
+            converted_path.rename(output_path)
+        except Exception as e:
+            shutil.rmtree(converted_path, ignore_errors=True)
+            # Fall back to source format if conversion fails
+            target_format = source_format
+
     # Parse new dataset
-    new_info = dataset_parser.parse_dataset(output_path, dataset["format"], request.output_name)
+    new_info = dataset_parser.parse_dataset(output_path, target_format, request.output_name)
     new_info["id"] = new_dataset_id
     active_datasets[new_dataset_id] = new_info
-    
+    _save_dataset_metadata(new_dataset_id, new_info)
+
     return {
         "success": True,
         "new_dataset": new_info,
@@ -642,7 +705,8 @@ async def delete_classes_from_dataset(dataset_id: str, request: ClassDeleteReque
     dataset_info = dataset_parser.parse_dataset(dataset_path, dataset["format"], dataset["name"])
     dataset_info["id"] = dataset_id
     active_datasets[dataset_id] = dataset_info
-    
+    _save_dataset_metadata(dataset_id, dataset_info)
+
     return {
         "success": True,
         "updated_dataset": dataset_info,
@@ -672,11 +736,45 @@ async def merge_classes_in_dataset(dataset_id: str, request: ClassMergeRequest):
     dataset_info = dataset_parser.parse_dataset(dataset_path, dataset["format"], dataset["name"])
     dataset_info["id"] = dataset_id
     active_datasets[dataset_id] = dataset_info
-    
+    _save_dataset_metadata(dataset_id, dataset_info)
+
     return {
         "success": True,
         "updated_dataset": dataset_info,
         "merged_annotations": merge_result["merged_annotations"]
+    }
+
+
+@app.post("/api/datasets/{dataset_id}/rename-class")
+async def rename_class_in_dataset(dataset_id: str, request: ClassRenameRequest):
+    """Rename a class in a dataset"""
+    if dataset_id not in active_datasets:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+
+    dataset = active_datasets[dataset_id]
+    dataset_path = DATASETS_DIR / dataset_id
+
+    if not request.old_name or not request.new_name:
+        raise HTTPException(status_code=400, detail="Both old_name and new_name are required")
+    if request.old_name == request.new_name:
+        raise HTTPException(status_code=400, detail="New name must differ from old name")
+
+    rename_result = annotation_manager.rename_class(
+        dataset_path,
+        dataset["format"],
+        request.old_name,
+        request.new_name
+    )
+
+    dataset_info = dataset_parser.parse_dataset(dataset_path, dataset["format"], dataset["name"])
+    dataset_info["id"] = dataset_id
+    active_datasets[dataset_id] = dataset_info
+    _save_dataset_metadata(dataset_id, dataset_info)
+
+    return {
+        "success": True,
+        "updated_dataset": dataset_info,
+        "renamed_annotations": rename_result["renamed_annotations"]
     }
 
 
@@ -1509,6 +1607,7 @@ async def auto_annotate_text_batch(
                         image_file,
                         confidence_threshold,
                         text_prompt=text_prompt,
+                        model_classes=model_manager.loaded_models[model_id].get("classes") or [],
                     )
                 except Exception as exc:
                     print(f"[batch:{job_id}] inference failed on {image_file.name}: {exc}")
@@ -1723,6 +1822,7 @@ async def restart_text_batch(job_id: str):
                         image_file,
                         confidence_threshold,
                         text_prompt=text_prompt,
+                        model_classes=model_manager.loaded_models[model_id].get("classes") or [],
                     )
                 except Exception as exc:
                     print(f"[batch:{job_id}] inference failed on {image_file.name}: {exc}")
@@ -1993,20 +2093,20 @@ async def list_formats():
     """List all supported annotation formats"""
     return {
         "formats": [
-            {"id": "yolo", "name": "YOLO", "description": "YOLOv5/v8 format with txt annotations", "tasks": ["detection", "segmentation"]},
-            {"id": "coco", "name": "COCO", "description": "COCO JSON format", "tasks": ["detection", "segmentation", "keypoints"]},
-            {"id": "voc", "name": "Pascal VOC", "description": "XML annotations", "tasks": ["detection"]},
-            {"id": "labelme", "name": "LabelMe", "description": "LabelMe JSON format", "tasks": ["detection", "segmentation"]},
-            {"id": "createml", "name": "CreateML", "description": "Apple CreateML format", "tasks": ["detection", "classification"]},
-            {"id": "tfrecord", "name": "TFRecord", "description": "TensorFlow Record format", "tasks": ["detection", "classification"]},
-            {"id": "csv", "name": "CSV", "description": "Simple CSV format", "tasks": ["detection", "classification"]},
-            {"id": "yolo_seg", "name": "YOLO Segmentation", "description": "YOLO polygon segmentation", "tasks": ["segmentation"]},
-            {"id": "coco_panoptic", "name": "COCO Panoptic", "description": "COCO panoptic segmentation", "tasks": ["segmentation"]},
-            {"id": "cityscapes", "name": "Cityscapes", "description": "Cityscapes format", "tasks": ["segmentation"]},
-            {"id": "ade20k", "name": "ADE20K", "description": "ADE20K segmentation format", "tasks": ["segmentation"]},
-            {"id": "classification", "name": "Classification Folder", "description": "Folder structure for classification", "tasks": ["classification"]},
-            {"id": "yolo_obb", "name": "YOLO OBB", "description": "YOLO oriented bounding boxes", "tasks": ["detection"]},
-            {"id": "dota", "name": "DOTA", "description": "DOTA format for oriented objects", "tasks": ["detection"]}
+            {"id": "yolo", "name": "YOLO", "description": "YOLOv5/v8/v9/v10/v11 txt annotations", "task": ["detection", "segmentation"]},
+            {"id": "coco", "name": "COCO JSON", "description": "COCO JSON format", "task": ["detection", "segmentation", "keypoints"]},
+            {"id": "pascal-voc", "name": "Pascal VOC", "description": "XML annotations per image", "task": ["detection"]},
+            {"id": "labelme", "name": "LabelMe", "description": "LabelMe JSON format", "task": ["detection", "segmentation"]},
+            {"id": "createml", "name": "CreateML", "description": "Apple CreateML format", "task": ["detection"]},
+            {"id": "tfrecord", "name": "TFRecord", "description": "TensorFlow Record format", "task": ["detection", "classification"]},
+            {"id": "csv", "name": "CSV", "description": "Simple CSV format", "task": ["detection"]},
+            {"id": "yolo_seg", "name": "YOLO Segmentation", "description": "YOLO polygon segmentation", "task": ["segmentation"]},
+            {"id": "coco_panoptic", "name": "COCO Panoptic", "description": "COCO panoptic segmentation", "task": ["panoptic-segmentation"]},
+            {"id": "cityscapes", "name": "Cityscapes", "description": "Cityscapes polygon + mask format", "task": ["segmentation"]},
+            {"id": "ade20k", "name": "ADE20K", "description": "ADE20K PNG segmentation masks", "task": ["segmentation"]},
+            {"id": "classification", "name": "Classification Folder", "description": "Folder-per-class structure", "task": ["classification"]},
+            {"id": "yolo_obb", "name": "YOLO OBB", "description": "YOLO oriented bounding boxes", "task": ["obb-detection"]},
+            {"id": "dota", "name": "DOTA", "description": "DOTA quad-polygon format", "task": ["obb-detection"]}
         ]
     }
 
@@ -2028,6 +2128,14 @@ async def convert_dataset(request: ConversionRequest):
         "pascal-voc": "pascal-voc",
         "yolo_seg": "yolo",
         "yolo-seg": "yolo",
+        "yolo_obb": "yolo-obb",
+        "yolov8-obb": "yolo-obb",
+        "coco_panoptic": "coco-panoptic",
+        "classification": "classification-folder",
+        "cityscapes": "cityscapes",
+        "ade20k": "ade20k",
+        "dota": "dota",
+        "tfrecord": "tfrecord",
     }
     target_format = format_map.get(request.target_format, request.target_format)
     
@@ -2174,9 +2282,65 @@ async def start_training(config: TrainingConfig, background_tasks: BackgroundTas
     """Start training a model on a dataset"""
     if config.dataset_id not in active_datasets:
         raise HTTPException(status_code=404, detail="Dataset not found")
-    
+
     dataset = active_datasets[config.dataset_id]
     dataset_path = DATASETS_DIR / config.dataset_id
+
+    # ── Dataset / model-type compatibility check ─────────────────────────────
+    ds_format    = (dataset.get("format") or "").lower()
+    ds_task_type = (dataset.get("task_type") or "detection").lower()
+    mt = config.model_type  # "yolo" | "segmentation" | "classification" | "rtdetr" | "rfdetr"
+
+    CLASSIFICATION_FORMATS = {"classification-folder", "classification_folder"}
+    SEGMENTATION_FORMATS   = {"cityscapes", "ade20k", "yolo-seg"}
+
+    is_cls_dataset = (
+        ds_format in CLASSIFICATION_FORMATS or ds_task_type == "classification"
+    )
+    is_seg_dataset = (
+        ds_format in SEGMENTATION_FORMATS or ds_task_type == "segmentation"
+    )
+    is_det_dataset = not is_cls_dataset and not is_seg_dataset
+
+    detection_model = mt in ("yolo", "rtdetr", "rfdetr")
+    seg_model       = mt == "segmentation"
+    cls_model       = mt == "classification"
+
+    if is_cls_dataset and not cls_model:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "This dataset is a classification dataset. "
+                "Please select a Classification model type."
+            ),
+        )
+    if is_seg_dataset and cls_model:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Segmentation datasets cannot be used to train a classification model. "
+                "Please select an Object Detection or Segmentation model type."
+            ),
+        )
+    if is_det_dataset and seg_model:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "This dataset does not contain polygon segmentation masks. "
+                "Please select an Object Detection model type, or convert your dataset "
+                "to a segmentation format first."
+            ),
+        )
+    if is_det_dataset and cls_model:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Detection datasets cannot be used for classification training. "
+                "Please use a dataset in classification-folder format."
+            ),
+        )
+    # Note: detection model on seg dataset is ALLOWED (auto-converts polygons → bboxes)
+    # ─────────────────────────────────────────────────────────────────────────
     
     # Start training in background
     training_id = training_manager.start_training(
@@ -2266,6 +2430,38 @@ async def export_trained_model(training_id: str):
         raise HTTPException(status_code=404, detail="Model not found")
 
     return FileResponse(model_path, filename=os.path.basename(model_path))
+
+
+@app.get("/api/train/{training_id}/report")
+async def download_training_report(training_id: str):
+    """Download a training report (JSON with epoch history and final metrics)."""
+    import json as _json
+    status = training_manager.get_status(training_id)
+    if not status:
+        raise HTTPException(status_code=404, detail="Training not found")
+
+    job = training_manager.training_jobs.get(training_id, {})
+    report = {
+        "training_id":   training_id,
+        "status":        status["status"],
+        "model_type":    job.get("model_type", ""),
+        "config":        {k: v for k, v in job.get("config", {}).items()
+                         if k not in ("device",)},
+        "started_at":    status["started_at"],
+        "device_info":   status["device_info"],
+        "total_epochs":  status["total_epochs"],
+        "current_epoch": status["current_epoch"],
+        "model_path":    status["model_path"],
+        "final_metrics": status["metrics"],
+        "epoch_history": status["epoch_history"],
+    }
+    content = _json.dumps(report, indent=2)
+    from fastapi.responses import Response
+    return Response(
+        content=content,
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="training_report_{training_id}.json"'},
+    )
 
 
 # ============== STATIC FILES ==============
@@ -2557,7 +2753,8 @@ async def find_duplicate_images(dataset_id: str, request: DuplicateDetectionRequ
     if request.method == "clip":
         result = clip_manager.find_similar_images(
             dataset_path,
-            similarity_threshold=request.threshold / 100.0
+            similarity_threshold=request.threshold / 100.0,
+            dataset_id=dataset_id,
         )
         # Normalize CLIP result keys to match hash-based result structure
         if result.get("success"):
@@ -2574,6 +2771,40 @@ async def find_duplicate_images(dataset_id: str, request: DuplicateDetectionRequ
             include_near_duplicates=request.include_near_duplicates
         )
 
+    return result
+
+
+@app.post("/api/datasets/{dataset_id}/cancel-scan")
+async def cancel_duplicate_scan(dataset_id: str):
+    """Cancel an in-progress CLIP duplicate scan for the given dataset."""
+    clip_manager.cancel_scan(dataset_id)
+    return {"success": True}
+
+
+class ClipRegroupRequest(BaseModel):
+    threshold: int = 90  # percentage (0-100)
+
+
+@app.post("/api/datasets/{dataset_id}/clip-regroup")
+async def clip_regroup_images(dataset_id: str, request: ClipRegroupRequest):
+    """Re-group CLIP similar images by threshold without recomputing embeddings"""
+    if dataset_id not in active_datasets:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+
+    dataset_path = DATASETS_DIR / dataset_id
+    result = clip_manager.regroup_by_threshold(
+        dataset_path,
+        similarity_threshold=request.threshold / 100.0,
+    )
+
+    if not result.get("success"):
+        raise HTTPException(status_code=400, detail=result.get("error", "Regroup failed"))
+
+    result["duplicate_groups"] = result.pop("similar_groups", 0)
+    result["total_duplicates"] = result.pop("total_similar", 0)
+    result["unique_images"] = result.get("total_images", 0) - result["total_duplicates"]
+    result["method"] = "clip"
+    result["threshold"] = request.threshold
     return result
 
 
@@ -2604,6 +2835,164 @@ async def remove_duplicate_images(dataset_id: str, request: RemoveDuplicatesRequ
     active_datasets[dataset_id] = dataset_info
     
     return {**result, "updated_dataset": dataset_info}
+
+
+# ============== SIMPLE AUGMENTATION ENDPOINTS (used by augmentation-view.tsx) ==============
+
+def _convert_frontend_augconfig(config: dict) -> dict:
+    """Convert frontend AugmentationConfig (camelCase) to augmenter format."""
+    augs = {}
+    if config.get("horizontalFlip"):
+        augs["flip_horizontal"] = {"enabled": True, "params": {}}
+    if config.get("verticalFlip"):
+        augs["flip_vertical"] = {"enabled": True, "params": {}}
+    if config.get("rotate90"):
+        augs["rotate"] = {"enabled": True, "params": {"angle_range": [90, 90]}}
+    elif config.get("randomRotate"):
+        limit = float(config.get("rotateLimit", 15))
+        augs["rotate"] = {"enabled": True, "params": {"angle_range": [-limit, limit]}}
+    if config.get("randomCrop"):
+        crop_scale = config.get("cropScale", [0.8, 1.0])
+        augs["crop"] = {"enabled": True, "params": {"crop_range": crop_scale}}
+    if config.get("brightness"):
+        limit = float(config.get("brightnessLimit", 0.2))
+        augs["brightness"] = {"enabled": True, "params": {"factor_range": [1 - limit, 1 + limit]}}
+    if config.get("contrast"):
+        limit = float(config.get("contrastLimit", 0.2))
+        augs["contrast"] = {"enabled": True, "params": {"factor_range": [1 - limit, 1 + limit]}}
+    if config.get("saturation"):
+        limit = float(config.get("saturationLimit", 0.2))
+        augs["saturation"] = {"enabled": True, "params": {"factor_range": [1 - limit, 1 + limit]}}
+    if config.get("hue"):
+        limit = float(config.get("hueLimit", 0.1))
+        augs["hue"] = {"enabled": True, "params": {"shift_range": [-limit * 360, limit * 360]}}
+    if config.get("blur"):
+        limit = float(config.get("blurLimit", 3))
+        augs["blur"] = {"enabled": True, "params": {"radius_range": [0.5, limit]}}
+    if config.get("noise"):
+        var = float(config.get("noiseVar", 0.1))
+        augs["noise"] = {"enabled": True, "params": {"variance": var}}
+    if config.get("cutout"):
+        size = int(config.get("cutoutSize", 32))
+        augs["cutout"] = {"enabled": True, "params": {"num_holes": 2, "size_range": [0.05, max(0.05, size / 640)]}}
+    return augs
+
+
+class SimplePreviewRequest(BaseModel):
+    dataset_id: str
+    config: Dict[str, Any]
+    num_previews: int = 6
+
+
+class SimpleAugmentRequest(BaseModel):
+    dataset_id: str
+    config: Dict[str, Any]
+    augment_factor: Optional[float] = None   # e.g. 2.0 → double the dataset
+    target_size: Optional[int] = None         # absolute target image count
+    output_name: Optional[str] = None
+    class_targets: Optional[Dict[str, int]] = None  # class_name -> target count
+
+
+@app.post("/api/augment/preview")
+async def augment_preview(request: SimplePreviewRequest):
+    """Generate multiple preview images showing augmentation results."""
+    import base64, io
+
+    dataset_id = request.dataset_id
+    if dataset_id not in active_datasets:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+
+    dataset_path = DATASETS_DIR / dataset_id
+    images = augmenter._find_images(dataset_path)
+    if not images:
+        raise HTTPException(status_code=400, detail="No images found in dataset")
+
+    augs = _convert_frontend_augconfig(request.config)
+    if not augs:
+        raise HTTPException(status_code=400, detail="No augmentations enabled")
+
+    aug_list = [(name, cfg.get("params", {})) for name, cfg in augs.items()]
+    previews = []
+    num_previews = min(request.num_previews, 6)
+
+    from PIL import Image as PILImage
+    for i in range(num_previews):
+        img_info = random.choice(images)
+        src_path = dataset_path / img_info["path"]
+        try:
+            img = PILImage.open(src_path).convert("RGB")
+            # Pick 1-3 random augmentations for each preview
+            n = random.randint(1, min(3, len(aug_list)))
+            selected = random.sample(aug_list, n)
+            for aug_name, params in selected:
+                img, _ = augmenter._apply_single_augmentation(img, aug_name, params)
+            # Thumbnail for fast transfer
+            img.thumbnail((320, 320), PILImage.Resampling.LANCZOS)
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=85)
+            b64 = base64.b64encode(buf.getvalue()).decode()
+            labels = [a[0] for a in selected]
+            previews.append({"data_url": f"data:image/jpeg;base64,{b64}", "augmentations": labels})
+        except Exception as e:
+            previews.append({"data_url": None, "augmentations": [], "error": str(e)})
+
+    return {"previews": previews}
+
+
+@app.post("/api/augment")
+async def simple_augment(request: SimpleAugmentRequest):
+    """Run augmentation from the augmentation-view UI."""
+    dataset_id = request.dataset_id
+    if dataset_id not in active_datasets:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+
+    dataset = active_datasets[dataset_id]
+    dataset_path = DATASETS_DIR / dataset_id
+    num_images = dataset.get("num_images", 0)
+
+    # Determine target size
+    if request.target_size and request.target_size > 0:
+        target_size = request.target_size
+    elif request.augment_factor and request.augment_factor > 0:
+        target_size = int(num_images * request.augment_factor)
+    else:
+        target_size = num_images * 2
+
+    augs = _convert_frontend_augconfig(request.config)
+    if not augs:
+        raise HTTPException(status_code=400, detail="No augmentations enabled")
+
+    output_name = request.output_name or f"{dataset['name']}_augmented"
+    new_dataset_id = str(uuid.uuid4())
+    output_path = DATASETS_DIR / new_dataset_id
+
+    # Class-targeted augmentation: if class_targets provided, adjust per-class
+    # For now we run global augmentation; class_targets are noted for future per-class logic
+    result = augmenter.augment_dataset(
+        dataset_path,
+        output_path,
+        dataset["format"],
+        target_size,
+        augs,
+        preserve_originals=True
+    )
+
+    if not result.get("success"):
+        shutil.rmtree(output_path, ignore_errors=True)
+        raise HTTPException(status_code=400, detail=result.get("error", "Augmentation failed"))
+
+    new_info = dataset_parser.parse_dataset(output_path, dataset["format"], output_name)
+    new_info["id"] = new_dataset_id
+    active_datasets[new_dataset_id] = new_info
+    _save_dataset_metadata(new_dataset_id, new_info)
+
+    return {
+        "success": True,
+        "new_dataset": new_info,
+        "total_images": result["total_images"],
+        "augmented_images": result["augmented_images"],
+        "original_images": result["original_images"],
+    }
 
 
 # ============== ENHANCED AUGMENTATION ==============
@@ -2725,29 +3114,7 @@ async def split_dataset_enhanced(dataset_id: str, request: EnhancedSplitRequest)
     }
 
 
-# ============== FORMAT INFORMATION ==============
-
-@app.get("/api/formats")
-async def list_formats():
-    """List all supported annotation formats"""
-    return {
-        "formats": [
-            {"id": "yolo", "name": "YOLO", "extensions": [".txt"], "task": ["detection", "segmentation"]},
-            {"id": "yolov5", "name": "YOLOv5", "extensions": [".txt"], "task": ["detection", "segmentation"]},
-            {"id": "yolov8", "name": "YOLOv8", "extensions": [".txt"], "task": ["detection", "segmentation", "pose"]},
-            {"id": "yolov9", "name": "YOLOv9", "extensions": [".txt"], "task": ["detection", "segmentation"]},
-            {"id": "yolov10", "name": "YOLOv10", "extensions": [".txt"], "task": ["detection"]},
-            {"id": "yolov11", "name": "YOLOv11", "extensions": [".txt"], "task": ["detection", "segmentation"]},
-            {"id": "coco", "name": "COCO JSON", "extensions": [".json"], "task": ["detection", "segmentation", "keypoint"]},
-            {"id": "pascal-voc", "name": "Pascal VOC", "extensions": [".xml"], "task": ["detection"]},
-            {"id": "labelme", "name": "LabelMe", "extensions": [".json"], "task": ["segmentation", "detection"]},
-            {"id": "createml", "name": "CreateML", "extensions": [".json"], "task": ["detection", "classification"]},
-            {"id": "tensorflow-csv", "name": "TensorFlow CSV", "extensions": [".csv"], "task": ["detection"]},
-            {"id": "classification-folder", "name": "Classification Folder", "extensions": [], "task": ["classification"]},
-            {"id": "supervisely", "name": "Supervisely", "extensions": [".json"], "task": ["detection", "segmentation"]},
-            {"id": "cvat", "name": "CVAT", "extensions": [".xml"], "task": ["detection", "segmentation"]},
-        ]
-    }
+# ============== FORMAT INFORMATION (alias — first /api/formats above takes precedence) ==============
 
 
 # ============== LOCAL FOLDER BROWSING ==============
@@ -2885,6 +3252,17 @@ async def serve_dataset_image(dataset_id: str, image_path: str):
     if not image_file.exists():
         # Fallback: try relative to raw dataset dir
         image_file = DATASETS_DIR / dataset_id / image_path
+    if not image_file.exists():
+        # Last-resort: recursive search by filename anywhere in the dataset directory
+        filename = Path(image_path).name
+        raw_dataset_dir = DATASETS_DIR / dataset_id
+        for ext_variant in [filename, filename.lower(), filename.upper()]:
+            matches = list(raw_dataset_dir.rglob(ext_variant))
+            # Exclude metadata/label text files
+            image_matches = [m for m in matches if m.suffix.lower() in {'.jpg', '.jpeg', '.png', '.bmp', '.webp', '.tif', '.tiff'}]
+            if image_matches:
+                image_file = image_matches[0]
+                break
     if not image_file.exists():
         raise HTTPException(status_code=404, detail="Image not found")
 
@@ -3252,7 +3630,14 @@ async def get_class_samples(dataset_id: str, samples_per_class: int = 3):
                     continue
                 # Register each class that appears in this file
                 seen_cids = set(a["class_id"] for a in annotations)
-                rel_path = str(img_file.relative_to(raw_path))
+                # Path must be relative to raw_path so serve_dataset_image
+                # (which also resolves via _find_dataset_root) can serve it.
+                # Use root-relative path to avoid double-subdirectory when the
+                # ZIP was extracted into a single enclosing folder.
+                try:
+                    rel_path = str(img_file.relative_to(root)).replace("\\", "/")
+                except ValueError:
+                    rel_path = str(img_file.relative_to(raw_path)).replace("\\", "/")
                 for cid in seen_cids:
                     if cid not in class_samples:
                         class_samples[cid] = []

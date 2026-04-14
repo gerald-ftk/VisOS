@@ -103,6 +103,12 @@ const navGroups: NavGroup[] = [
     label: 'Process',
     items: [
       {
+        id: 'split',
+        label: 'Train / Val / Test',
+        icon: Scissors,
+        description: 'Divide your dataset into training, validation, and test sets for proper model evaluation.',
+      },
+      {
         id: 'augmentation',
         label: 'Augmentation',
         icon: Sparkles,
@@ -113,12 +119,6 @@ const navGroups: NavGroup[] = [
         label: 'Video Frames',
         icon: Film,
         description: 'Extract individual frames from video files to use as training images.',
-      },
-      {
-        id: 'split',
-        label: 'Train / Val / Test',
-        icon: Scissors,
-        description: 'Divide your dataset into training, validation, and test sets for proper model evaluation.',
       },
       {
         id: 'convert',

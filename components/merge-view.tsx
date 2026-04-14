@@ -19,14 +19,10 @@ import {
 } from "lucide-react"
 import type { Dataset } from "@/app/page"
 
-const FORMAT_OPTIONS = [
-  { value: "yolo", label: "YOLO (txt)" },
-  { value: "coco", label: "COCO (JSON)" },
-  { value: "pascal_voc", label: "Pascal VOC (XML)" },
-  { value: "csv", label: "CSV" },
-  { value: "yolo_seg", label: "YOLO Segmentation" },
-  { value: "coco_seg", label: "COCO Segmentation" },
-]
+interface Format {
+  id: string
+  name: string
+}
 
 interface MergeViewProps {
   datasets?: Dataset[]
@@ -35,6 +31,7 @@ interface MergeViewProps {
 }
 
 export function MergeView({ datasets: propDatasets = [], setDatasets: propSetDatasets, apiUrl = "http://localhost:8000" }: MergeViewProps) {
+  const [formats, setFormats] = useState<Format[]>([])
   const [outputFormat, setOutputFormat] = useState("yolo")
   const [outputName, setOutputName] = useState("merged_dataset")
   const [isMerging, setIsMerging] = useState(false)
@@ -43,6 +40,14 @@ export function MergeView({ datasets: propDatasets = [], setDatasets: propSetDat
   const [mergedDatasetName, setMergedDatasetName] = useState<string | null>(null)
   const [remapClasses, setRemapClasses] = useState(true)
   const [selectedDatasets, setSelectedDatasets] = useState<Set<string>>(new Set())
+
+  // Fetch available formats from the API
+  useEffect(() => {
+    fetch(`${apiUrl}/api/formats`)
+      .then(r => r.json())
+      .then(data => { if (data.formats) setFormats(data.formats) })
+      .catch(() => {})
+  }, [apiUrl])
 
   // Auto-select all datasets when the list changes
   useEffect(() => {
@@ -229,8 +234,8 @@ export function MergeView({ datasets: propDatasets = [], setDatasets: propSetDat
                 <Select value={outputFormat} onValueChange={setOutputFormat} disabled={isMerging}>
                   <SelectTrigger><SelectValue /></SelectTrigger>
                   <SelectContent>
-                    {FORMAT_OPTIONS.map(f => (
-                      <SelectItem key={f.value} value={f.value}>{f.label}</SelectItem>
+                    {formats.map(f => (
+                      <SelectItem key={f.id} value={f.id}>{f.name}</SelectItem>
                     ))}
                   </SelectContent>
                 </Select>

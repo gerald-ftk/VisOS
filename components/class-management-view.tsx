@@ -6,20 +6,30 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Checkbox } from '@/components/ui/checkbox'
-import { 
-  Layers, 
-  Trash2, 
-  GitMerge, 
-  Copy, 
+import {
+  Layers,
+  Trash2,
+  GitMerge,
+  Copy,
   Plus,
   AlertTriangle,
   CheckCircle,
   ArrowRight,
   Search,
-  RefreshCw
+  RefreshCw,
+  Pencil
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import type { Dataset } from '@/app/page'
+
+const EXPORT_FORMATS = [
+  { id: 'yolo',           name: 'YOLO' },
+  { id: 'coco',           name: 'COCO JSON' },
+  { id: 'pascal-voc',     name: 'Pascal VOC' },
+  { id: 'labelme',        name: 'LabelMe' },
+  { id: 'tensorflow-csv', name: 'TensorFlow CSV' },
+  { id: 'createml',       name: 'CreateML' },
+]
 
 interface ClassManagementViewProps {
   selectedDataset: Dataset | null
@@ -43,16 +53,19 @@ export function ClassManagementView({
   const [classes, setClasses] = useState<ClassInfo[]>([])
   const [loading, setLoading] = useState(false)
   const [searchQuery, setSearchQuery] = useState('')
-  const [activeTab, setActiveTab] = useState<'extract' | 'delete' | 'merge' | 'add'>('extract')
+  const [activeTab, setActiveTab] = useState<'extract' | 'delete' | 'merge' | 'add' | 'rename'>('extract')
   const [newClassName, setNewClassName] = useState('')
   const [mergeTargetName, setMergeTargetName] = useState('')
   const [extractOutputName, setExtractOutputName] = useState('')
+  const [extractOutputFormat, setExtractOutputFormat] = useState('')
+  const [renameNewName, setRenameNewName] = useState('')
   const [message, setMessage] = useState<{ type: 'success' | 'error', text: string } | null>(null)
 
   useEffect(() => {
     if (selectedDataset) {
       loadClasses()
       setExtractOutputName(`${selectedDataset.name}_extracted`)
+      setExtractOutputFormat(selectedDataset.format || '')
     }
   }, [selectedDataset])
 
@@ -124,7 +137,8 @@ export function ClassManagementView({
         body: JSON.stringify({
           dataset_id: selectedDataset.id,
           classes_to_extract: selectedClasses.map(c => c.name),
-          output_name: extractOutputName || `${selectedDataset.name}_extracted`
+          output_name: extractOutputName || `${selectedDataset.name}_extracted`,
+          output_format: extractOutputFormat || undefined
         })
       })
 
@@ -133,16 +147,57 @@ export function ClassManagementView({
         if (data.new_dataset) {
           setDatasets([...datasets, data.new_dataset])
         }
-        setMessage({ 
-          type: 'success', 
-          text: `Extracted ${selectedClasses.length} classes to new dataset with ${data.extracted_images} images` 
+        setMessage({
+          type: 'success',
+          text: `Extracted ${selectedClasses.length} class(es) to new dataset with ${data.extracted_images} images`
         })
         deselectAll()
       } else {
-        throw new Error('Failed to extract classes')
+        const body = await response.json().catch(() => ({}))
+        throw new Error(body.detail || 'Failed to extract classes')
       }
     } catch (err) {
-      setMessage({ type: 'error', text: 'Failed to extract classes' })
+      setMessage({ type: 'error', text: err instanceof Error ? err.message : 'Failed to extract classes' })
+    }
+    setLoading(false)
+  }
+
+  const handleRenameClass = async () => {
+    if (!selectedDataset || selectedClasses.length !== 1 || !renameNewName.trim()) return
+    setLoading(true)
+    setMessage(null)
+
+    try {
+      const response = await fetch(`${apiUrl}/api/datasets/${selectedDataset.id}/rename-class`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          dataset_id: selectedDataset.id,
+          old_name: selectedClasses[0].name,
+          new_name: renameNewName.trim()
+        })
+      })
+
+      if (response.ok) {
+        const data = await response.json()
+        if (data.updated_dataset) {
+          setDatasets(datasets.map(d =>
+            d.id === selectedDataset.id ? data.updated_dataset : d
+          ))
+        }
+        setMessage({
+          type: 'success',
+          text: `Renamed "${selectedClasses[0].name}" to "${renameNewName}" (${data.renamed_annotations} annotations updated)`
+        })
+        setRenameNewName('')
+        deselectAll()
+        loadClasses()
+      } else {
+        const body = await response.json().catch(() => ({}))
+        throw new Error(body.detail || 'Failed to rename class')
+      }
+    } catch (err) {
+      setMessage({ type: 'error', text: err instanceof Error ? err.message : 'Failed to rename class' })
     }
     setLoading(false)
   }
@@ -170,20 +225,21 @@ export function ClassManagementView({
       if (response.ok) {
         const data = await response.json()
         if (data.updated_dataset) {
-          setDatasets(datasets.map(d => 
+          setDatasets(datasets.map(d =>
             d.id === selectedDataset.id ? data.updated_dataset : d
           ))
         }
-        setMessage({ 
-          type: 'success', 
-          text: `Deleted ${selectedClasses.length} classes (${data.deleted_annotations} annotations removed)` 
+        setMessage({
+          type: 'success',
+          text: `Deleted ${selectedClasses.length} class(es) (${data.deleted_annotations} annotations removed)`
         })
         loadClasses()
       } else {
-        throw new Error('Failed to delete classes')
+        const body = await response.json().catch(() => ({}))
+        throw new Error(body.detail || 'Failed to delete classes')
       }
     } catch (err) {
-      setMessage({ type: 'error', text: 'Failed to delete classes' })
+      setMessage({ type: 'error', text: err instanceof Error ? err.message : 'Failed to delete classes' })
     }
     setLoading(false)
   }
@@ -207,21 +263,22 @@ export function ClassManagementView({
       if (response.ok) {
         const data = await response.json()
         if (data.updated_dataset) {
-          setDatasets(datasets.map(d => 
+          setDatasets(datasets.map(d =>
             d.id === selectedDataset.id ? data.updated_dataset : d
           ))
         }
-        setMessage({ 
-          type: 'success', 
-          text: `Merged ${selectedClasses.length} classes into "${mergeTargetName}" (${data.merged_annotations} annotations updated)` 
+        setMessage({
+          type: 'success',
+          text: `Merged ${selectedClasses.length} class(es) into "${mergeTargetName}" (${data.merged_annotations} annotations updated)`
         })
         setMergeTargetName('')
         loadClasses()
       } else {
-        throw new Error('Failed to merge classes')
+        const body = await response.json().catch(() => ({}))
+        throw new Error(body.detail || 'Failed to merge classes')
       }
     } catch (err) {
-      setMessage({ type: 'error', text: 'Failed to merge classes' })
+      setMessage({ type: 'error', text: err instanceof Error ? err.message : 'Failed to merge classes' })
     }
     setLoading(false)
   }
@@ -356,8 +413,8 @@ export function ClassManagementView({
         </Card>
 
         <div className="flex-1 overflow-y-auto">
-          <div className="flex gap-2 mb-4">
-            {(['extract', 'delete', 'merge', 'add'] as const).map((tab) => (
+          <div className="flex flex-wrap gap-2 mb-4">
+            {(['extract', 'delete', 'merge', 'rename', 'add'] as const).map((tab) => (
               <Button
                 key={tab}
                 variant={activeTab === tab ? 'default' : 'outline'}
@@ -367,6 +424,7 @@ export function ClassManagementView({
                 {tab === 'extract' && <Copy className="w-4 h-4 mr-2" />}
                 {tab === 'delete' && <Trash2 className="w-4 h-4 mr-2" />}
                 {tab === 'merge' && <GitMerge className="w-4 h-4 mr-2" />}
+                {tab === 'rename' && <Pencil className="w-4 h-4 mr-2" />}
                 {tab === 'add' && <Plus className="w-4 h-4 mr-2" />}
                 {tab.charAt(0).toUpperCase() + tab.slice(1)}
               </Button>
@@ -381,17 +439,33 @@ export function ClassManagementView({
                   Extract Classes to New Dataset
                 </CardTitle>
                 <CardDescription>
-                  Create a new dataset containing only the selected classes
+                  Create a new dataset containing only the selected classes. Only images that have at least one annotation of those classes are included.
                 </CardDescription>
               </CardHeader>
               <CardContent className="space-y-4">
                 <div className="space-y-2">
                   <Label>Output Dataset Name</Label>
-                  <Input 
+                  <Input
                     value={extractOutputName}
                     onChange={(e) => setExtractOutputName(e.target.value)}
                     placeholder="New dataset name"
                   />
+                </div>
+
+                <div className="space-y-2">
+                  <Label>Output Format</Label>
+                  <select
+                    className="w-full border rounded-md px-3 py-2 text-sm bg-background"
+                    value={extractOutputFormat}
+                    onChange={(e) => setExtractOutputFormat(e.target.value)}
+                  >
+                    {EXPORT_FORMATS.map(f => (
+                      <option key={f.id} value={f.id}>{f.name}</option>
+                    ))}
+                  </select>
+                  <p className="text-xs text-muted-foreground">
+                    Currently: {selectedDataset?.format || '—'}. Change to convert the extracted dataset.
+                  </p>
                 </div>
 
                 {selectedClasses.length > 0 && (
@@ -407,8 +481,8 @@ export function ClassManagementView({
                   </div>
                 )}
 
-                <Button 
-                  onClick={handleExtractClasses} 
+                <Button
+                  onClick={handleExtractClasses}
                   disabled={loading || selectedClasses.length === 0}
                   className="w-full"
                 >
@@ -528,6 +602,59 @@ export function ClassManagementView({
                 {selectedClasses.length < 2 && (
                   <p className="text-xs text-muted-foreground text-center">
                     Select at least 2 classes to merge
+                  </p>
+                )}
+              </CardContent>
+            </Card>
+          )}
+
+          {activeTab === 'rename' && (
+            <Card>
+              <CardHeader>
+                <CardTitle className="text-base flex items-center gap-2">
+                  <Pencil className="w-5 h-5" />
+                  Rename Class
+                </CardTitle>
+                <CardDescription>
+                  Rename a class across all annotations in the dataset
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                {selectedClasses.length === 1 ? (
+                  <>
+                    <div className="p-3 bg-muted rounded-lg">
+                      <p className="text-sm text-muted-foreground mb-1">Renaming class:</p>
+                      <p className="font-medium">{selectedClasses[0].name}</p>
+                      <p className="text-xs text-muted-foreground mt-1">{selectedClasses[0].count} annotation(s)</p>
+                    </div>
+                    <div className="space-y-2">
+                      <Label>New Class Name</Label>
+                      <Input
+                        value={renameNewName}
+                        onChange={(e) => setRenameNewName(e.target.value)}
+                        placeholder="Enter new name"
+                        onKeyDown={(e) => e.key === 'Enter' && handleRenameClass()}
+                      />
+                    </div>
+                    {renameNewName && (
+                      <div className="flex items-center gap-2 text-sm p-2 bg-muted rounded-lg">
+                        <span className="px-2 py-0.5 bg-background rounded text-xs">{selectedClasses[0].name}</span>
+                        <ArrowRight className="w-4 h-4 text-muted-foreground" />
+                        <span className="px-2 py-0.5 bg-primary text-primary-foreground rounded text-xs">{renameNewName}</span>
+                      </div>
+                    )}
+                    <Button
+                      onClick={handleRenameClass}
+                      disabled={loading || !renameNewName.trim() || renameNewName.trim() === selectedClasses[0].name}
+                      className="w-full"
+                    >
+                      {loading ? 'Renaming...' : 'Rename Class'}
+                      <Pencil className="w-4 h-4 ml-2" />
+                    </Button>
+                  </>
+                ) : (
+                  <p className="text-sm text-muted-foreground text-center py-4">
+                    Select exactly 1 class to rename
                   </p>
                 )}
               </CardContent>

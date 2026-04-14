@@ -94,7 +94,11 @@ export function SplitView({ datasets, setDatasets, selectedDataset, apiUrl }: Sp
 
       if (!response.ok) {
         const err = await response.json()
-        throw new Error(err.detail || 'Split failed')
+        const detail = err.detail
+        const msg = Array.isArray(detail)
+          ? detail.map((e: { msg?: string }) => e.msg || JSON.stringify(e)).join('; ')
+          : (typeof detail === 'string' ? detail : 'Split failed')
+        throw new Error(msg)
       }
 
       const data = await response.json()

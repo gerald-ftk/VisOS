@@ -276,7 +276,7 @@ export function YamlWizardView({ selectedDataset, apiUrl }: { selectedDataset: D
             </Badge>
             <Button
               disabled={!allLabeled}
-              onClick={() => { setVerifySampleIdx(0); setPhase('verifying') }}
+              onClick={() => setPhase('verifying')}
             >
               <Eye className="w-4 h-4 mr-2" />
               Review & Save

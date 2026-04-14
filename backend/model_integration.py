@@ -151,6 +151,31 @@ class ModelManager:
                 "path": str(model_file),
             })
 
+        # 2b. GroundingDINO models cached in the HuggingFace hub cache
+        #     (these are never stored as .pt files in models_dir, so the disk
+        #     scan above misses them entirely)
+        try:
+            from huggingface_hub import scan_cache_info
+            cached_repos = {repo.repo_id for repo in scan_cache_info().repos}
+            for model_id, hf_id in self._GROUNDINGDINO_HF_IDS.items():
+                if model_id in seen_ids:
+                    continue
+                if hf_id in cached_repos:
+                    catalog = next(
+                        (e for e in self._PRETRAINED_CATALOG if e["id"] == model_id), None
+                    )
+                    seen_ids.add(model_id)
+                    models.append({
+                        "id": model_id,
+                        "name": catalog["name"] if catalog else model_id,
+                        "type": "groundingdino",
+                        "loaded": False,
+                        "pretrained": True,
+                        "downloaded": True,
+                    })
+        except Exception:
+            pass
+
         # 3. Pretrained catalog entries not yet downloaded
         for entry in self._PRETRAINED_CATALOG:
             if entry["id"] not in seen_ids:
@@ -679,7 +704,7 @@ class ModelManager:
         try:
             import rfdetr as _r  # noqa: F401
         except ImportError:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "rfdetr", "-q"], timeout=300)
+            subprocess.check_call([sys.executable, "-m", "pip", "install", 'rfdetr[train,loggers]', "-q"], timeout=300)
         try:
             from rfdetr import RFDETRBase, RFDETRLarge
             # Choose the right class based on the filename
@@ -711,7 +736,7 @@ class ModelManager:
             import rfdetr as _rfdetr_pkg  # noqa: F401
         except ImportError:
             subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", "rfdetr", "-q"],
+                [sys.executable, "-m", "pip", "install", 'rfdetr[train,loggers]', "-q"],
                 timeout=300,
             )
 
@@ -832,6 +857,7 @@ class ModelManager:
                 annotations = self._run_inference(
                     model, model_type, image_file, confidence_threshold,
                     text_prompt=text_prompt,
+                    model_classes=model_info.get("classes") or [],
                 )
                 
                 if annotations:
@@ -994,6 +1020,7 @@ class ModelManager:
                 model, model_type, image_file, confidence_threshold,
                 prompt_point=prompt_point,
                 text_prompt=text_prompt,
+                model_classes=model_info.get("classes") or [],
             )
             return annotations
         except Exception:
@@ -1007,6 +1034,7 @@ class ModelManager:
         confidence_threshold: float,
         prompt_point: Optional[tuple] = None,
         text_prompt: Optional[str] = None,
+        model_classes: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """Run inference on a single image"""
         annotations = []
@@ -1278,6 +1306,8 @@ class ModelManager:
                         if i < len(names_arr):
                             raw = names_arr[i]
                             cls_name = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+                        elif model_classes and cls_id < len(model_classes):
+                            cls_name = model_classes[cls_id]
                         else:
                             cls_name = str(cls_id)
                         annotations.append({
@@ -1295,22 +1325,30 @@ class ModelManager:
                 import torch
                 texts = [t.strip() for t in text_prompt.split(",") if t.strip()] if text_prompt else ["object"]
                 model.set_classes(texts)
-                # set_classes computes text embeddings via CLIP on CPU; move them to the
-                # inference device so they match the model weights during prediction.
+                # set_classes computes text embeddings via CLIP on CPU; move the entire
+                # model (including all text tensors) to the inference device.
                 if device != "cpu":
                     target_device = f"cuda:{device}" if isinstance(device, int) else str(device)
                     try:
-                        # txt_feats may live directly on the model or on the predictor's copy
+                        # Move the full model graph — this covers txt_feats, txt_pe and
+                        # any other tensors that set_classes() computed on CPU.
                         for container in [
                             getattr(model, "model", None),
                             getattr(getattr(model, "predictor", None), "model", None),
                         ]:
-                            if container is None:
-                                continue
-                            if hasattr(container, "txt_feats") and container.txt_feats is not None:
-                                container.txt_feats = container.txt_feats.to(target_device)
-                            if hasattr(container, "txt_pe") and container.txt_pe is not None:
-                                container.txt_pe = container.txt_pe.to(target_device)
+                            if container is not None:
+                                try:
+                                    container.to(target_device)
+                                except Exception:
+                                    pass
+                                # Belt-and-suspenders: also move individual text attrs
+                                for attr in ("txt_feats", "txt_pe"):
+                                    val = getattr(container, attr, None)
+                                    if val is not None:
+                                        try:
+                                            setattr(container, attr, val.to(target_device))
+                                        except Exception:
+                                            pass
                     except Exception:
                         pass
                 results = model(str(image_path), conf=confidence_threshold, verbose=False, device=device)

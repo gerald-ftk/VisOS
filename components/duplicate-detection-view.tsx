@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { Button } from '@/components/ui/button'
 import { Slider } from '@/components/ui/slider'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
@@ -46,17 +46,54 @@ export function DuplicateDetectionView({ selectedDataset, apiUrl }: DuplicateDet
   const [result, setResult] = useState<ScanResult | null>(null)
   // track which item in each group is selected to keep (index within group)
   const [keepSelections, setKeepSelections] = useState<Record<number, number>>({})
+  // CLIP embedding cache tracking
+  const [clipEmbeddingsReady, setClipEmbeddingsReady] = useState(false)
+  const [clipEmbeddingsDatasetId, setClipEmbeddingsDatasetId] = useState<string | null>(null)
+  // AbortController for the current scan fetch
+  const scanAbortRef = useRef<AbortController | null>(null)
+  // Track which dataset_id has an active CLIP scan (for backend cancel)
+  const activeScanDatasetRef = useRef<string | null>(null)
 
+  const cancelActiveScan = (datasetId: string | null) => {
+    if (!datasetId) return
+    // Abort the in-flight fetch
+    scanAbortRef.current?.abort()
+    // Tell the backend to stop GPU computation
+    navigator.sendBeacon(`${apiUrl}/api/datasets/${datasetId}/cancel-scan`)
+    activeScanDatasetRef.current = null
+  }
+
+  // Cancel scan when switching datasets
   useEffect(() => {
+    cancelActiveScan(activeScanDatasetRef.current)
     setResult(null)
     setKeepSelections({})
+    setClipEmbeddingsReady(false)
+    setClipEmbeddingsDatasetId(null)
   }, [selectedDataset?.id])
+
+  // Cancel scan when component unmounts (navigating away)
+  useEffect(() => {
+    return () => {
+      cancelActiveScan(activeScanDatasetRef.current)
+    }
+  }, [])
+
+  // Cancel scan on page reload / tab close
+  useEffect(() => {
+    const handleUnload = () => cancelActiveScan(activeScanDatasetRef.current)
+    window.addEventListener('beforeunload', handleUnload)
+    return () => window.removeEventListener('beforeunload', handleUnload)
+  }, [])
 
   const scan = async () => {
     if (!selectedDataset) return
     setIsScanning(true)
     setResult(null)
     setKeepSelections({})
+    const abortController = new AbortController()
+    scanAbortRef.current = abortController
+    if (method === 'clip') activeScanDatasetRef.current = selectedDataset.id
     try {
       const resp = await fetch(`${apiUrl}/api/datasets/${selectedDataset.id}/find-duplicates`, {
         method: 'POST',
@@ -66,6 +103,7 @@ export function DuplicateDetectionView({ selectedDataset, apiUrl }: DuplicateDet
           threshold: method === 'clip' ? Math.round(threshold) : threshold,
           include_near_duplicates: true,
         }),
+        signal: abortController.signal,
       })
       if (!resp.ok) throw new Error('Scan failed')
       const data: ScanResult = await resp.json()
@@ -75,13 +113,44 @@ export function DuplicateDetectionView({ selectedDataset, apiUrl }: DuplicateDet
       const defaults: Record<number, number> = {}
       data.groups.forEach((_, gi) => { defaults[gi] = 0 })
       setKeepSelections(defaults)
+      if (method === 'clip') {
+        setClipEmbeddingsReady(true)
+        setClipEmbeddingsDatasetId(selectedDataset.id)
+      }
       if (data.duplicate_groups === 0) {
         toast.success('No duplicates found — dataset looks clean!')
       } else {
         toast.info(`Found ${data.duplicate_groups} duplicate group(s) with ${data.total_duplicates} removable image(s)`)
       }
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Scan failed')
+      if ((err as any)?.name !== 'AbortError') {
+        toast.error(err instanceof Error ? err.message : 'Scan failed')
+      }
+    } finally {
+      activeScanDatasetRef.current = null
+      scanAbortRef.current = null
+      setIsScanning(false)
+    }
+  }
+
+  const regroup = async () => {
+    if (!selectedDataset || !clipEmbeddingsReady) return
+    setIsScanning(true)
+    try {
+      const resp = await fetch(`${apiUrl}/api/datasets/${selectedDataset.id}/clip-regroup`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ threshold: Math.round(threshold) }),
+      })
+      if (!resp.ok) throw new Error('Regroup failed')
+      const data: ScanResult = await resp.json()
+      if (!data.success) throw new Error((data as any).error ?? 'Regroup failed')
+      setResult(data)
+      const defaults: Record<number, number> = {}
+      data.groups.forEach((_, gi) => { defaults[gi] = 0 })
+      setKeepSelections(defaults)
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Regroup failed')
     } finally {
       setIsScanning(false)
     }
@@ -187,11 +256,23 @@ export function DuplicateDetectionView({ selectedDataset, apiUrl }: DuplicateDet
                 max={method === 'clip' ? 99 : 64}
                 step={1}
               />
-              <p className="text-[9px] text-muted-foreground/50">
-                {method === 'clip'
-                  ? 'Higher % = only near-identical images'
-                  : 'Lower = stricter (0 = exact match)'}
-              </p>
+              <div className="flex items-center justify-between gap-2">
+                <p className="text-[9px] text-muted-foreground/50">
+                  {method === 'clip'
+                    ? 'Higher % = only near-identical images'
+                    : 'Lower = stricter (0 = exact match)'}
+                </p>
+                {method === 'clip' && clipEmbeddingsReady && clipEmbeddingsDatasetId === selectedDataset?.id && (
+                  <button
+                    onClick={regroup}
+                    disabled={isScanning || isRemoving}
+                    className="shrink-0 text-[9px] font-mono px-1.5 py-0.5 rounded bg-primary/10 text-primary hover:bg-primary/20 disabled:opacity-40 transition-colors"
+                    title="Re-apply threshold using cached embeddings"
+                  >
+                    Re-apply
+                  </button>
+                )}
+              </div>
             </div>
           )}
 
@@ -214,6 +295,11 @@ export function DuplicateDetectionView({ selectedDataset, apiUrl }: DuplicateDet
 
           {/* Actions */}
           <div className="flex items-center gap-2 ml-auto">
+            {method === 'clip' && clipEmbeddingsReady && clipEmbeddingsDatasetId === selectedDataset?.id && (
+              <span className="text-[9px] font-mono text-success/80 flex items-center gap-1">
+                <Cpu className="w-2.5 h-2.5" /> embeddings cached
+              </span>
+            )}
             <Button size="sm" onClick={scan} disabled={isScanning || isRemoving} className="gap-1.5">
               {isScanning
                 ? <><Loader2 className="w-3.5 h-3.5 animate-spin" /> Scanning…</>

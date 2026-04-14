@@ -84,6 +84,16 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
   const [brushPoints, setBrushPoints] = useState<{ x: number; y: number }[]>([])
   const [isBrushing, setIsBrushing] = useState(false)
 
+  // Drag state for moving selected annotation in select mode
+  const [isDragging, setIsDragging] = useState(false)
+  const [dragStart, setDragStart] = useState<{ x: number; y: number; origBbox: number[] } | null>(null)
+
+  // Add new class state
+  const [addingClass, setAddingClass] = useState(false)
+  const [newClassName, setNewClassName] = useState('')
+  // Local copy of dataset classes so we can add to it without mutating the prop
+  const [localClasses, setLocalClasses] = useState<string[]>(selectedDataset?.classes || [])
+
   // SAM state
   const [isSamLoading, setIsSamLoading] = useState(false)
 
@@ -122,11 +132,15 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
   const pollIntervalsRef = useRef<Record<string, ReturnType<typeof setInterval>>>({})
   // When true, the allImages useEffect skips the reset-to-index-0 behaviour
   const silentRefreshRef = useRef(false)
+  // When set, the allImages useEffect jumps to this image id instead of index 0
+  const initialImageIdRef = useRef<string | null>(null)
 
   // ── Keep refs in sync with latest state ─────────────────────────────────────
   useEffect(() => { currentImageRef.current = currentImage }, [currentImage])
   useEffect(() => { selectedDatasetRef.current = selectedDataset }, [selectedDataset])
   useEffect(() => { annotationsRef.current = annotations }, [annotations])
+  // Sync localClasses when dataset changes
+  useEffect(() => { setLocalClasses(selectedDataset?.classes || []) }, [selectedDataset?.id])
 
   // ── Clear all poll intervals on unmount ───────────────────────────────────────
   useEffect(() => {
@@ -192,6 +206,7 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
     }
     loadModels()
     if (selectedDataset.classes?.length) setActiveClass(selectedDataset.classes[0])
+    setLocalClasses(selectedDataset.classes || [])
   }, [selectedDataset])
 
   useEffect(() => {
@@ -209,11 +224,24 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
       silentRefreshRef.current = false
       return
     }
-    setCurrentIndex(0)
-    if (imgs.length > 0) loadImageFile(imgs[0])
+    if (imgs.length > 0) {
+      const targetId = initialImageIdRef.current
+      if (targetId) {
+        initialImageIdRef.current = null
+        onInitialImageConsumed?.()
+        const idx = Math.max(0, imgs.findIndex(img => img.id === targetId))
+        setCurrentIndex(idx)
+        loadImageFile(imgs[idx])
+      } else {
+        setCurrentIndex(0)
+        loadImageFile(imgs[0])
+      }
+    }
   }, [selectedSplit, selectedClass, allImages])
 
   const initFromImages = (images: ImageData[]) => {
+    // Set ref BEFORE setAllImages so the allImages useEffect can consume it
+    if (initialImageId) initialImageIdRef.current = initialImageId
     setAllImages(images)
     const splits = [...new Set(images.map(i => i.split).filter(Boolean) as string[])]
     const classes = [...new Set(
@@ -225,15 +253,7 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
     setAvailableSplits(splits)
     setAvailableClasses(classes)
     setFilteredImages(images)
-    if (images.length > 0) {
-      // Jump to initialImageId if provided (e.g. opened from gallery)
-      const startIdx = initialImageId
-        ? Math.max(0, images.findIndex(img => img.id === initialImageId))
-        : 0
-      setCurrentIndex(startIdx)
-      loadImageFile(images[startIdx])
-      onInitialImageConsumed?.()
-    }
+    // currentIndex + image loading are handled by the allImages useEffect below
   }
 
   const loadImageList = async () => {
@@ -301,6 +321,7 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
 
   const downloadModel = async (model: { id: string; name: string; type: string }) => {
     setDownloadingModelId(model.id)
+    toast.info(`Downloading ${model.name}… this may take a minute`, { duration: 60000, id: `dl-${model.id}` })
     try {
       const fd = new FormData()
       fd.append('model_type', model.type)
@@ -320,9 +341,12 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
         }, 1000)
       })
 
+      toast.dismiss(`dl-${model.id}`)
       await loadModels()
-      toast.success(`${model.name} downloaded`)
+      setSelectedModel(model.id)
+      toast.success(`${model.name} ready`)
     } catch (err) {
+      toast.dismiss(`dl-${model.id}`)
       toast.error(`Download failed: ${err instanceof Error ? err.message : err}`)
     } finally {
       setDownloadingModelId(null)
@@ -341,6 +365,7 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
   // ── Load a single image file (fast — just one HTTP request) ─────────────────
   const loadImageFile = useCallback(async (imgData: ImageData) => {
     setIsImageLoading(true)
+    setError(null)
     setCurrentImage(imgData)
     setAnnotations(imgData.annotations || [])
     setSelectedAnnotation(null)
@@ -396,7 +421,8 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
     selectedIdx: number | null,
     tBox: { x: number; y: number; w: number; h: number } | null,
     polyPts: { x: number; y: number }[],
-    zoomLevel = zoom
+    zoomLevel = zoom,
+    kpList: { x: number; y: number; label: string }[] = []
   ) => {
     const canvas = canvasRef.current
     const container = containerRef.current
@@ -488,15 +514,41 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
       ctx.fillStyle = '#fff'; ctx.font = '12px sans-serif'
       ctx.fillText(`${polyPts.length} pts — click to add · Enter/DblClick to finish`, 16, canvas.height - 14)
     }
+
+    // Draw in-progress keypoints
+    if (kpList.length > 0) {
+      kpList.forEach((kp, i) => {
+        const px = kp.x * img.width * scale
+        const py = kp.y * img.height * scale
+        ctx.beginPath()
+        ctx.arc(px, py, 6, 0, Math.PI * 2)
+        ctx.fillStyle = '#a855f7'
+        ctx.fill()
+        ctx.strokeStyle = '#fff'
+        ctx.lineWidth = 2
+        ctx.stroke()
+        // Draw cross
+        ctx.strokeStyle = '#fff'
+        ctx.lineWidth = 1.5
+        ctx.beginPath()
+        ctx.moveTo(px - 9, py); ctx.lineTo(px + 9, py)
+        ctx.moveTo(px, py - 9); ctx.lineTo(px, py + 9)
+        ctx.stroke()
+        // Label
+        ctx.font = 'bold 10px sans-serif'
+        ctx.fillStyle = '#a855f7'
+        ctx.fillText(kp.label || String(i + 1), px + 8, py - 4)
+      })
+    }
   }, [zoom])
 
   const drawCanvas = useCallback(() => {
-    if (imageRef.current) drawCanvasWithData(imageRef.current, annotations, selectedAnnotation, tempBox, polygonPoints, zoom)
-  }, [annotations, selectedAnnotation, tempBox, polygonPoints, zoom, drawCanvasWithData])
+    if (imageRef.current) drawCanvasWithData(imageRef.current, annotations, selectedAnnotation, tempBox, polygonPoints, zoom, keypointList)
+  }, [annotations, selectedAnnotation, tempBox, polygonPoints, zoom, keypointList, drawCanvasWithData])
 
   useEffect(() => {
     if (!isImageLoading && imageRef.current) drawCanvas()
-  }, [annotations, selectedAnnotation, zoom, isImageLoading])
+  }, [annotations, selectedAnnotation, zoom, isImageLoading, keypointList])
 
   // ── Canvas interaction ───────────────────────────────────────────────────────
   const getCanvasCoords = (e: React.MouseEvent<HTMLCanvasElement>) => {
@@ -528,10 +580,24 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
       const newKps = [...keypointList, kp]
       setKeypointList(newKps)
       // Redraw with keypoints shown
-      if (imageRef.current) drawCanvasWithData(imageRef.current, annotations, selectedAnnotation, tempBox, polygonPoints, zoom)
+      if (imageRef.current) drawCanvasWithData(imageRef.current, annotations, selectedAnnotation, tempBox, polygonPoints, zoom, newKps)
     } else if (activeTool === 'sam') {
       handleSamClick(coords)
     } else {
+      // In select mode: if clicking on already-selected bbox, start drag
+      if (activeTool === 'select' && selectedAnnotation !== null) {
+        const ann = annotations[selectedAnnotation]
+        if (ann?.bbox?.length === 4) {
+          const scale = scaleRef.current
+          const [x, y, w, h] = ann.bbox
+          const imgX = coords.x / scale, imgY = coords.y / scale
+          if (imgX >= x && imgX <= x + w && imgY >= y && imgY <= y + h) {
+            setIsDragging(true)
+            setDragStart({ x: coords.x, y: coords.y, origBbox: [...ann.bbox] })
+            return
+          }
+        }
+      }
       handleAnnotationClick(coords)
     }
   }
@@ -551,14 +617,33 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
       }
       return
     }
+    // Drag selected annotation
+    if (isDragging && dragStart && selectedAnnotation !== null) {
+      const coords = getCanvasCoords(e)
+      const scale = scaleRef.current
+      const dx = (coords.x - dragStart.x) / scale
+      const dy = (coords.y - dragStart.y) / scale
+      const [ox, oy, ow, oh] = dragStart.origBbox
+      const next = annotations.map((ann, i) =>
+        i === selectedAnnotation ? { ...ann, bbox: [ox + dx, oy + dy, ow, oh] } : ann
+      )
+      setAnnotations(next)
+      return
+    }
     if (!isDrawing || !drawStart || activeTool !== 'bbox') return
     const c = getCanvasCoords(e)
     const box = { x: Math.min(drawStart.x, c.x), y: Math.min(drawStart.y, c.y), w: Math.abs(c.x - drawStart.x), h: Math.abs(c.y - drawStart.y) }
     setTempBox(box)
-    if (imageRef.current) drawCanvasWithData(imageRef.current, annotations, selectedAnnotation, box, polygonPoints, zoom)
+    if (imageRef.current) drawCanvasWithData(imageRef.current, annotations, selectedAnnotation, box, polygonPoints, zoom, keypointList)
   }
 
   const handleCanvasMouseUp = () => {
+    if (isDragging) {
+      setIsDragging(false)
+      setDragStart(null)
+      saveToHistory(annotations)
+      return
+    }
     if (activeTool === 'brush' && isBrushing) {
       setIsBrushing(false)
       if (brushPoints.length > 3) {
@@ -570,7 +655,7 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
         const pts = brushPoints.flatMap(p => [p.x / scale / img.width, p.y / scale / img.height])
         const ann: Annotation = {
           type: 'polygon',
-          class_id: selectedDataset?.classes?.indexOf(activeClass) ?? 0,
+          class_id: localClasses.indexOf(activeClass),
           class_name: activeClass || 'brush_mask',
           points: pts,
           normalized: true
@@ -589,7 +674,7 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
     if (bbox[2] > 5 && bbox[3] > 5) {
       const ann: Annotation = {
         type: 'bbox',
-        class_id: selectedDataset?.classes?.indexOf(activeClass) ?? 0,
+        class_id: localClasses.indexOf(activeClass),
         class_name: activeClass || 'unknown',
         bbox
       }
@@ -663,7 +748,7 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
     const pts = keypointList.flatMap(kp => [kp.x, kp.y])
     const ann: Annotation = {
       type: 'keypoints',
-      class_id: selectedDataset?.classes?.indexOf(activeClass) ?? 0,
+      class_id: localClasses.indexOf(activeClass),
       class_name: activeClass || 'skeleton',
       points: pts,
       normalized: true
@@ -701,7 +786,7 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
     const points = polygonPoints.flatMap(pt => [pt.x / scale, pt.y / scale])
     const ann: Annotation = {
       type: 'polygon',
-      class_id: selectedDataset?.classes?.indexOf(activeClass) ?? 0,
+      class_id: localClasses.indexOf(activeClass),
       class_name: activeClass || 'unknown',
       points
     }
@@ -776,8 +861,17 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
     }
   }
 
+  const [isModelLoading, setIsModelLoading] = useState(false)
+
   const autoAnnotate = async () => {
     if (!selectedDataset || !currentImage || !selectedModel) return
+    // Check if model is downloaded but not loaded into memory — first call will load it
+    const modelInfo = models.find(m => m.id === selectedModel)
+    const needsLoad = modelInfo?.downloaded && !modelInfo?.loaded
+    if (needsLoad) {
+      setIsModelLoading(true)
+      toast.info('Loading model into memory — first annotation may take 10–30 s…', { duration: 20000, id: 'model-load' })
+    }
     setIsAutoAnnotating(true)
     try {
       const params = new URLSearchParams({
@@ -791,6 +885,7 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
         `${apiUrl}/api/auto-annotate/${selectedDataset.id}/single/${currentImage.id}?${params}`,
         { method: 'POST' }
       )
+      if (needsLoad) toast.dismiss('model-load')
       if (!resp.ok) throw new Error('Auto-annotation failed')
       const data = await resp.json()
       if (data.annotations?.length) {
@@ -802,10 +897,36 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
       } else {
         toast.info('No objects detected')
       }
+      // Refresh model list so the model shows as loaded now
+      if (needsLoad) loadModels()
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Auto-annotation failed')
     } finally {
       setIsAutoAnnotating(false)
+      setIsModelLoading(false)
+    }
+  }
+
+  const submitNewClass = async () => {
+    const name = newClassName.trim()
+    if (!name || !selectedDataset) return
+    setAddingClass(false)
+    setNewClassName('')
+    try {
+      const resp = await fetch(
+        `${apiUrl}/api/datasets/${selectedDataset.id}/add-classes`,
+        { method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ dataset_id: selectedDataset.id, new_classes: [name], use_model: false }) }
+      )
+      if (!resp.ok) throw new Error('Failed to add class')
+      const data = await resp.json()
+      const updatedClasses: string[] = data.updated_dataset?.classes || [...localClasses, name]
+      setLocalClasses(updatedClasses)
+      setAvailableClasses(updatedClasses)
+      setActiveClass(name)
+      toast.success(`Class "${name}" added`)
+    } catch {
+      toast.error('Failed to add class')
     }
   }
 
@@ -1025,8 +1146,8 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
       if (e.key === 'q') setActiveTool('sam')
       // 1-9 class assignment shortcuts
       const num = parseInt(e.key)
-      if (!isNaN(num) && num >= 1 && num <= 9 && selectedDataset?.classes) {
-        const cls = selectedDataset.classes[num - 1]
+      if (!isNaN(num) && num >= 1 && num <= 9 && localClasses.length > 0) {
+        const cls = localClasses[num - 1]
         if (cls) {
           setActiveClass(cls)
           // Also update selected annotation's class if one is selected
@@ -1045,7 +1166,8 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [currentIndex, filteredImages.length, selectedAnnotation, annotations, polygonPoints, keypointList, selectedDataset])
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentIndex, filteredImages, selectedAnnotation, annotations, polygonPoints, keypointList, selectedDataset, navigateImage, localClasses])
 
   // ── Empty state ──────────────────────────────────────────────────────────────
   if (!selectedDataset) {
@@ -1153,12 +1275,23 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
           <div className="w-px h-6 bg-border" />
 
           {/* Active annotation class */}
-          <Select value={activeClass} onValueChange={setActiveClass}>
+          <Select value={activeClass} onValueChange={cls => {
+            setActiveClass(cls)
+            // If an annotation is selected, also change its class
+            if (selectedAnnotation !== null) {
+              const clsIdx = localClasses.indexOf(cls)
+              const next = annotations.map((ann, i) =>
+                i === selectedAnnotation ? { ...ann, class_name: cls, class_id: clsIdx } : ann
+              )
+              setAnnotations(next)
+              saveToHistory(next)
+            }
+          }}>
             <SelectTrigger className="w-36 h-8 text-xs">
               <SelectValue placeholder="Class" />
             </SelectTrigger>
             <SelectContent>
-              {(selectedDataset.classes || []).map((cls, i) => (
+              {localClasses.map((cls, i) => (
                 <SelectItem key={cls} value={cls}>
                   <span className="flex items-center gap-2">
                     {i < 9 && <kbd className="text-[9px] px-1 py-0.5 bg-muted rounded font-mono">{i+1}</kbd>}
@@ -1168,6 +1301,30 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
               ))}
             </SelectContent>
           </Select>
+
+          {/* Add new class button */}
+          {addingClass ? (
+            <form className="flex items-center gap-1" onSubmit={e => { e.preventDefault(); submitNewClass() }}>
+              <Input
+                autoFocus
+                value={newClassName}
+                onChange={e => setNewClassName(e.target.value)}
+                placeholder="class name"
+                className="h-8 w-24 text-xs bg-background border-border"
+                onKeyDown={e => { if (e.key === 'Escape') { setAddingClass(false); setNewClassName('') } }}
+              />
+              <Button type="submit" size="sm" variant="outline" className="h-8 px-2 text-xs" disabled={!newClassName.trim()}>
+                Add
+              </Button>
+              <Button type="button" size="sm" variant="ghost" className="h-8 px-1" onClick={() => { setAddingClass(false); setNewClassName('') }}>
+                <X className="w-3 h-3" />
+              </Button>
+            </form>
+          ) : (
+            <Button size="sm" variant="outline" className="h-8 px-2" title="Add new class" onClick={() => setAddingClass(true)}>
+              <Plus className="w-3.5 h-3.5" />
+            </Button>
+          )}
 
           <div className="w-px h-6 bg-border" />
 
@@ -1289,12 +1446,18 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
               <Loader2 className="w-10 h-10 animate-spin text-primary" />
               <p className="text-sm font-medium">Loading image...</p>
             </div>
+          ) : error && !imageRef.current ? (
+            <div className="flex flex-col items-center gap-3 text-destructive">
+              <AlertCircle className="w-10 h-10" />
+              <p className="text-sm font-medium">{error}</p>
+              <p className="text-xs text-muted-foreground">Image file could not be served — check dataset paths</p>
+            </div>
           ) : currentImage ? (
             <>
               <canvas
                 ref={canvasRef}
                 className={cn(
-                  "max-w-full max-h-full shadow-lg rounded",
+                  "shadow-lg rounded",
                   activeTool !== 'select' && "cursor-crosshair",
                   activeTool === 'select' && "cursor-pointer",
                   activeTool === 'brush' && "cursor-cell",
@@ -1431,20 +1594,26 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
             value={selectedModel}
             onValueChange={v => {
               const m = models.find(m => m.id === v)
-              if (m && !m.downloaded) downloadModel(m)
-              else setSelectedModel(v)
+              if (m && !m.downloaded && downloadingModelId !== m.id) downloadModel(m)
+              else if (m?.downloaded) setSelectedModel(v)
             }}
           >
             <SelectTrigger className="h-8 text-xs bg-background border-border">
-              <SelectValue placeholder="Select model…" />
+              {downloadingModelId
+                ? <span className="flex items-center gap-1.5 text-muted-foreground">
+                    <Loader2 className="w-3 h-3 animate-spin" />
+                    Downloading…
+                  </span>
+                : <SelectValue placeholder="Select model…" />
+              }
             </SelectTrigger>
             <SelectContent>
               {models.map(m => (
-                <SelectItem key={m.id} value={m.id}>
+                <SelectItem key={m.id} value={m.id} disabled={!m.downloaded && downloadingModelId !== m.id && downloadingModelId !== null}>
                   <div className="flex items-center gap-2 w-full">
                     <span className="flex-1 truncate">{m.name}</span>
                     {downloadingModelId === m.id
-                      ? <Loader2 className="w-3 h-3 animate-spin text-muted-foreground shrink-0" />
+                      ? <span className="text-[9px] text-primary font-mono shrink-0 flex items-center gap-1"><Loader2 className="w-3 h-3 animate-spin" />Downloading</span>
                       : m.downloaded
                         ? <CheckCircle2 className="w-3 h-3 text-primary shrink-0" />
                         : <Download className="w-3 h-3 text-muted-foreground shrink-0" />
@@ -1468,9 +1637,11 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
             onClick={autoAnnotate}
             disabled={!selectedModel || isAutoAnnotating || runningJobCount > 0}
           >
-            {isAutoAnnotating
-              ? <><Loader2 className="w-3.5 h-3.5 animate-spin" /> Annotating…</>
-              : <><Wand2 className="w-3.5 h-3.5" strokeWidth={1.5} /> Auto-Annotate</>
+            {isModelLoading
+              ? <><Loader2 className="w-3.5 h-3.5 animate-spin" /> Loading model…</>
+              : isAutoAnnotating
+                ? <><Loader2 className="w-3.5 h-3.5 animate-spin" /> Annotating…</>
+                : <><Wand2 className="w-3.5 h-3.5" strokeWidth={1.5} /> Auto-Annotate</>
             }
           </Button>
         </div>
@@ -1596,6 +1767,36 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
                     <span className="font-medium truncate">{ann.class_name}</span>
                     <span className="text-[10px] text-muted-foreground capitalize shrink-0">{ann.type}</span>
                   </div>
+                  {selectedAnnotation === idx && (
+                    <div className="mt-1.5 flex items-center gap-1" onClick={e => e.stopPropagation()}>
+                      <select
+                        value={ann.class_name}
+                        onChange={e => {
+                          const cls = e.target.value
+                          const clsIdx = localClasses.indexOf(cls)
+                          const next = annotations.map((a, i) =>
+                            i === idx ? { ...a, class_name: cls, class_id: clsIdx } : a
+                          )
+                          setAnnotations(next); saveToHistory(next); setActiveClass(cls)
+                        }}
+                        className="flex-1 h-6 text-[10px] rounded border border-border bg-background text-foreground px-1"
+                      >
+                        {localClasses.map(c => (
+                          <option key={c} value={c}>{c}</option>
+                        ))}
+                      </select>
+                      <button
+                        onClick={() => {
+                          const next = annotations.filter((_, i) => i !== idx)
+                          setAnnotations(next); saveToHistory(next); setSelectedAnnotation(null)
+                        }}
+                        className="p-1 rounded hover:bg-destructive/10 hover:text-destructive transition-colors"
+                        title="Delete annotation"
+                      >
+                        <Trash2 className="w-3 h-3" />
+                      </button>
+                    </div>
+                  )}
                 </div>
               ))
             )}

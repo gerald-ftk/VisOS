@@ -9,11 +9,11 @@ import { Switch } from '@/components/ui/switch'
 import { Slider } from '@/components/ui/slider'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Progress } from '@/components/ui/progress'
-import { 
-  Wand2, 
-  RefreshCcw, 
-  ImagePlus, 
-  Contrast, 
+import {
+  Wand2,
+  RefreshCcw,
+  ImagePlus,
+  Contrast,
   Maximize2,
   RotateCw,
   FlipHorizontal,
@@ -22,11 +22,11 @@ import {
   Droplets,
   Palette,
   Play,
-  Square,
   Eye,
   SunDim,
   Shuffle,
-  Copy
+  Target,
+  Users
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import type { Dataset } from '@/app/page'
@@ -39,7 +39,6 @@ interface AugmentationViewProps {
 }
 
 interface AugmentationConfig {
-  // Geometric transforms
   horizontalFlip: boolean
   horizontalFlipProb: number
   verticalFlip: boolean
@@ -53,8 +52,6 @@ interface AugmentationConfig {
   resize: boolean
   resizeWidth: number
   resizeHeight: number
-  
-  // Color transforms
   brightness: boolean
   brightnessLimit: number
   contrast: boolean
@@ -67,14 +64,18 @@ interface AugmentationConfig {
   blurLimit: number
   noise: boolean
   noiseVar: number
-  
-  // Advanced
   mosaic: boolean
   mosaicProb: number
   mixup: boolean
   mixupAlpha: number
   cutout: boolean
   cutoutSize: number
+}
+
+interface PreviewItem {
+  data_url: string | null
+  augmentations: string[]
+  error?: string
 }
 
 const defaultConfig: AugmentationConfig = {
@@ -111,29 +112,105 @@ const defaultConfig: AugmentationConfig = {
   cutoutSize: 32
 }
 
-export function AugmentationView({ 
-  selectedDataset, 
+const presetConfigs = {
+  light: {
+    ...defaultConfig,
+    horizontalFlip: true,
+    randomRotate: true,
+    rotateLimit: 10,
+    brightness: true,
+    brightnessLimit: 0.15,
+    contrast: true,
+    contrastLimit: 0.15,
+    saturation: false,
+    blur: false,
+    noise: false
+  },
+  medium: {
+    ...defaultConfig,
+    horizontalFlip: true,
+    verticalFlip: true,
+    randomRotate: true,
+    rotateLimit: 20,
+    brightness: true,
+    brightnessLimit: 0.25,
+    contrast: true,
+    contrastLimit: 0.25,
+    saturation: true,
+    blur: true
+  },
+  heavy: {
+    ...defaultConfig,
+    horizontalFlip: true,
+    verticalFlip: true,
+    rotate90: true,
+    randomRotate: true,
+    rotateLimit: 30,
+    randomCrop: true,
+    brightness: true,
+    brightnessLimit: 0.3,
+    contrast: true,
+    contrastLimit: 0.3,
+    saturation: true,
+    hue: true,
+    blur: true,
+    noise: true,
+    mosaic: true,
+    cutout: true
+  }
+}
+
+// Preset button with accent hover style
+function PresetButton({ label, onClick }: { label: string; onClick: () => void }) {
+  const [hovered, setHovered] = useState(false)
+  return (
+    <button
+      onClick={onClick}
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
+      className="px-3 py-1 text-sm rounded-md border transition-colors"
+      style={{
+        borderColor: hovered ? '#00d4b4' : undefined,
+        color: hovered ? '#00d4b4' : undefined,
+        backgroundColor: 'transparent'
+      }}
+    >
+      {label}
+    </button>
+  )
+}
+
+export function AugmentationView({
+  selectedDataset,
   datasets,
   setDatasets,
-  apiUrl 
+  apiUrl
 }: AugmentationViewProps) {
   const [config, setConfig] = useState<AugmentationConfig>(defaultConfig)
+  // Size mode: 'factor' or 'absolute'
+  const [sizeMode, setSizeMode] = useState<'factor' | 'absolute'>('factor')
   const [augmentFactor, setAugmentFactor] = useState(2)
+  const [factorInput, setFactorInput] = useState('2')
+  const [targetSize, setTargetSize] = useState(0)
   const [outputName, setOutputName] = useState('')
-  const [previewImage, setPreviewImage] = useState<string | null>(null)
+  const [previews, setPreviews] = useState<PreviewItem[]>([])
   const [previewLoading, setPreviewLoading] = useState(false)
   const [isAugmenting, setIsAugmenting] = useState(false)
   const [progress, setProgress] = useState(0)
   const [message, setMessage] = useState<{ type: 'success' | 'error', text: string } | null>(null)
+  // Class targets: class_name -> target count
+  const [classTargets, setClassTargets] = useState<Record<string, number>>({})
+  const [classAugEnabled, setClassAugEnabled] = useState(false)
 
   useEffect(() => {
     if (selectedDataset) {
       setOutputName(`${selectedDataset.name}_augmented`)
+      setTargetSize(Math.ceil(selectedDataset.num_images * augmentFactor))
     }
   }, [selectedDataset])
 
   const updateConfig = <K extends keyof AugmentationConfig>(
-    key: K, 
+    key: K,
     value: AugmentationConfig[K]
   ) => {
     setConfig(prev => ({ ...prev, [key]: value }))
@@ -142,18 +219,22 @@ export function AugmentationView({
   const handlePreview = async () => {
     if (!selectedDataset) return
     setPreviewLoading(true)
+    setPreviews([])
     try {
       const response = await fetch(`${apiUrl}/api/augment/preview`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           dataset_id: selectedDataset.id,
-          config
+          config,
+          num_previews: 6
         })
       })
       if (response.ok) {
         const data = await response.json()
-        setPreviewImage(data.preview_url)
+        setPreviews(data.previews || [])
+      } else {
+        console.error('Preview failed:', await response.text())
       }
     } catch (err) {
       console.error('Preview failed:', err)
@@ -161,94 +242,65 @@ export function AugmentationView({
     setPreviewLoading(false)
   }
 
+  const computedTargetSize = sizeMode === 'factor'
+    ? Math.ceil((selectedDataset?.num_images ?? 0) * augmentFactor)
+    : targetSize
+
   const handleAugment = async () => {
     if (!selectedDataset) return
     setIsAugmenting(true)
     setProgress(0)
     setMessage(null)
 
+    const progressInterval = setInterval(() => {
+      setProgress(prev => Math.min(prev + 4, 88))
+    }, 600)
+
     try {
+      const body: Record<string, unknown> = {
+        dataset_id: selectedDataset.id,
+        config,
+        output_name: outputName || `${selectedDataset.name}_augmented`
+      }
+      if (sizeMode === 'factor') {
+        body.augment_factor = augmentFactor
+      } else {
+        body.target_size = targetSize
+      }
+      if (classAugEnabled && Object.keys(classTargets).length > 0) {
+        body.class_targets = classTargets
+      }
+
       const response = await fetch(`${apiUrl}/api/augment`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          dataset_id: selectedDataset.id,
-          config,
-          augment_factor: augmentFactor,
-          output_name: outputName || `${selectedDataset.name}_augmented`
-        })
+        body: JSON.stringify(body)
       })
 
-      // Simulate progress
-      const progressInterval = setInterval(() => {
-        setProgress(prev => Math.min(prev + 5, 90))
-      }, 500)
+      clearInterval(progressInterval)
 
       if (response.ok) {
-        clearInterval(progressInterval)
         setProgress(100)
         const data = await response.json()
         if (data.new_dataset) {
           setDatasets([...datasets, data.new_dataset])
         }
-        setMessage({ 
-          type: 'success', 
-          text: `Created augmented dataset with ${data.total_images} images` 
+        setMessage({
+          type: 'success',
+          text: `Created augmented dataset with ${data.total_images} images`
         })
       } else {
-        clearInterval(progressInterval)
-        throw new Error('Augmentation failed')
+        const err = await response.json().catch(() => ({}))
+        throw new Error(err.detail || 'Augmentation failed')
       }
-    } catch (err) {
-      setMessage({ type: 'error', text: 'Augmentation failed' })
+    } catch (err: unknown) {
+      clearInterval(progressInterval)
+      setMessage({ type: 'error', text: err instanceof Error ? err.message : 'Augmentation failed' })
     }
     setIsAugmenting(false)
   }
 
-  const presetConfigs = {
-    light: {
-      ...defaultConfig,
-      horizontalFlip: true,
-      randomRotate: true,
-      rotateLimit: 10,
-      brightness: true,
-      brightnessLimit: 0.15,
-      contrast: true,
-      contrastLimit: 0.15
-    },
-    medium: {
-      ...defaultConfig,
-      horizontalFlip: true,
-      verticalFlip: true,
-      randomRotate: true,
-      rotateLimit: 20,
-      brightness: true,
-      brightnessLimit: 0.25,
-      contrast: true,
-      contrastLimit: 0.25,
-      saturation: true,
-      blur: true
-    },
-    heavy: {
-      ...defaultConfig,
-      horizontalFlip: true,
-      verticalFlip: true,
-      rotate90: true,
-      randomRotate: true,
-      rotateLimit: 30,
-      randomCrop: true,
-      brightness: true,
-      brightnessLimit: 0.3,
-      contrast: true,
-      contrastLimit: 0.3,
-      saturation: true,
-      hue: true,
-      blur: true,
-      noise: true,
-      mosaic: true,
-      cutout: true
-    }
-  }
+  const datasetClasses: string[] = (selectedDataset as unknown as Record<string, unknown>)?.classes as string[] ?? []
 
   if (!selectedDataset) {
     return (
@@ -274,15 +326,15 @@ export function AugmentationView({
           </p>
         </div>
         <div className="flex items-center gap-2">
-          <Button 
-            variant="outline" 
+          <Button
+            variant="outline"
             onClick={handlePreview}
             disabled={previewLoading}
           >
             <Eye className="w-4 h-4 mr-2" />
-            Preview
+            {previewLoading ? 'Loading...' : 'Preview'}
           </Button>
-          <Button 
+          <Button
             onClick={handleAugment}
             disabled={isAugmenting}
           >
@@ -323,21 +375,13 @@ export function AugmentationView({
 
       <div className="flex gap-6 flex-1 min-h-0">
         <div className="flex-1 overflow-y-auto pr-2">
+          {/* Quick Presets */}
           <div className="flex items-center gap-2 mb-4">
             <span className="text-sm text-muted-foreground">Quick Presets:</span>
-            <Button variant="outline" size="sm" onClick={() => setConfig(presetConfigs.light)}>
-              Light
-            </Button>
-            <Button variant="outline" size="sm" onClick={() => setConfig(presetConfigs.medium)}>
-              Medium
-            </Button>
-            <Button variant="outline" size="sm" onClick={() => setConfig(presetConfigs.heavy)}>
-              Heavy
-            </Button>
-            <Button variant="ghost" size="sm" onClick={() => setConfig(defaultConfig)}>
-              <RefreshCcw className="w-4 h-4 mr-1" />
-              Reset
-            </Button>
+            <PresetButton label="Light" onClick={() => setConfig(presetConfigs.light)} />
+            <PresetButton label="Medium" onClick={() => setConfig(presetConfigs.medium)} />
+            <PresetButton label="Heavy" onClick={() => setConfig(presetConfigs.heavy)} />
+            <PresetButton label="↺ Reset" onClick={() => setConfig(defaultConfig)} />
           </div>
 
           <Tabs defaultValue="geometric" className="w-full">
@@ -362,7 +406,7 @@ export function AugmentationView({
                       <FlipHorizontal className="w-4 h-4 text-muted-foreground" />
                       <Label>Horizontal Flip</Label>
                     </div>
-                    <Switch 
+                    <Switch
                       checked={config.horizontalFlip}
                       onCheckedChange={(v) => updateConfig('horizontalFlip', v)}
                     />
@@ -376,9 +420,7 @@ export function AugmentationView({
                       <Slider
                         value={[config.horizontalFlipProb]}
                         onValueChange={([v]) => updateConfig('horizontalFlipProb', v)}
-                        min={0}
-                        max={1}
-                        step={0.1}
+                        min={0} max={1} step={0.1}
                       />
                     </div>
                   )}
@@ -388,7 +430,7 @@ export function AugmentationView({
                       <FlipVertical className="w-4 h-4 text-muted-foreground" />
                       <Label>Vertical Flip</Label>
                     </div>
-                    <Switch 
+                    <Switch
                       checked={config.verticalFlip}
                       onCheckedChange={(v) => updateConfig('verticalFlip', v)}
                     />
@@ -406,15 +448,14 @@ export function AugmentationView({
                 <CardContent className="space-y-4">
                   <div className="flex items-center justify-between">
                     <Label>90° Rotation</Label>
-                    <Switch 
+                    <Switch
                       checked={config.rotate90}
                       onCheckedChange={(v) => updateConfig('rotate90', v)}
                     />
                   </div>
-
                   <div className="flex items-center justify-between">
                     <Label>Random Rotation</Label>
-                    <Switch 
+                    <Switch
                       checked={config.randomRotate}
                       onCheckedChange={(v) => updateConfig('randomRotate', v)}
                     />
@@ -428,9 +469,7 @@ export function AugmentationView({
                       <Slider
                         value={[config.rotateLimit]}
                         onValueChange={([v]) => updateConfig('rotateLimit', v)}
-                        min={0}
-                        max={45}
-                        step={5}
+                        min={0} max={45} step={5}
                       />
                     </div>
                   )}
@@ -450,15 +489,14 @@ export function AugmentationView({
                       <Crop className="w-4 h-4 text-muted-foreground" />
                       <Label>Random Crop</Label>
                     </div>
-                    <Switch 
+                    <Switch
                       checked={config.randomCrop}
                       onCheckedChange={(v) => updateConfig('randomCrop', v)}
                     />
                   </div>
-
                   <div className="flex items-center justify-between">
                     <Label>Resize</Label>
-                    <Switch 
+                    <Switch
                       checked={config.resize}
                       onCheckedChange={(v) => updateConfig('resize', v)}
                     />
@@ -467,7 +505,7 @@ export function AugmentationView({
                     <div className="grid grid-cols-2 gap-4 pl-6">
                       <div className="space-y-2">
                         <Label className="text-xs">Width</Label>
-                        <Input 
+                        <Input
                           type="number"
                           value={config.resizeWidth}
                           onChange={(e) => updateConfig('resizeWidth', parseInt(e.target.value) || 640)}
@@ -475,7 +513,7 @@ export function AugmentationView({
                       </div>
                       <div className="space-y-2">
                         <Label className="text-xs">Height</Label>
-                        <Input 
+                        <Input
                           type="number"
                           value={config.resizeHeight}
                           onChange={(e) => updateConfig('resizeHeight', parseInt(e.target.value) || 640)}
@@ -498,7 +536,7 @@ export function AugmentationView({
                 <CardContent className="space-y-4">
                   <div className="flex items-center justify-between">
                     <Label>Brightness</Label>
-                    <Switch 
+                    <Switch
                       checked={config.brightness}
                       onCheckedChange={(v) => updateConfig('brightness', v)}
                     />
@@ -512,19 +550,16 @@ export function AugmentationView({
                       <Slider
                         value={[config.brightnessLimit]}
                         onValueChange={([v]) => updateConfig('brightnessLimit', v)}
-                        min={0}
-                        max={0.5}
-                        step={0.05}
+                        min={0} max={0.5} step={0.05}
                       />
                     </div>
                   )}
-
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-2">
                       <Contrast className="w-4 h-4 text-muted-foreground" />
                       <Label>Contrast</Label>
                     </div>
-                    <Switch 
+                    <Switch
                       checked={config.contrast}
                       onCheckedChange={(v) => updateConfig('contrast', v)}
                     />
@@ -538,9 +573,7 @@ export function AugmentationView({
                       <Slider
                         value={[config.contrastLimit]}
                         onValueChange={([v]) => updateConfig('contrastLimit', v)}
-                        min={0}
-                        max={0.5}
-                        step={0.05}
+                        min={0} max={0.5} step={0.05}
                       />
                     </div>
                   )}
@@ -557,7 +590,7 @@ export function AugmentationView({
                 <CardContent className="space-y-4">
                   <div className="flex items-center justify-between">
                     <Label>Saturation</Label>
-                    <Switch 
+                    <Switch
                       checked={config.saturation}
                       onCheckedChange={(v) => updateConfig('saturation', v)}
                     />
@@ -567,16 +600,13 @@ export function AugmentationView({
                       <Slider
                         value={[config.saturationLimit]}
                         onValueChange={([v]) => updateConfig('saturationLimit', v)}
-                        min={0}
-                        max={0.5}
-                        step={0.05}
+                        min={0} max={0.5} step={0.05}
                       />
                     </div>
                   )}
-
                   <div className="flex items-center justify-between">
                     <Label>Hue Shift</Label>
-                    <Switch 
+                    <Switch
                       checked={config.hue}
                       onCheckedChange={(v) => updateConfig('hue', v)}
                     />
@@ -594,7 +624,7 @@ export function AugmentationView({
                 <CardContent className="space-y-4">
                   <div className="flex items-center justify-between">
                     <Label>Gaussian Blur</Label>
-                    <Switch 
+                    <Switch
                       checked={config.blur}
                       onCheckedChange={(v) => updateConfig('blur', v)}
                     />
@@ -608,20 +638,30 @@ export function AugmentationView({
                       <Slider
                         value={[config.blurLimit]}
                         onValueChange={([v]) => updateConfig('blurLimit', v)}
-                        min={1}
-                        max={7}
-                        step={2}
+                        min={1} max={7} step={2}
                       />
                     </div>
                   )}
-
                   <div className="flex items-center justify-between">
                     <Label>Gaussian Noise</Label>
-                    <Switch 
+                    <Switch
                       checked={config.noise}
                       onCheckedChange={(v) => updateConfig('noise', v)}
                     />
                   </div>
+                  {config.noise && (
+                    <div className="space-y-2 pl-6">
+                      <div className="flex items-center justify-between text-sm">
+                        <span>Variance</span>
+                        <span className="text-muted-foreground">{config.noiseVar.toFixed(2)}</span>
+                      </div>
+                      <Slider
+                        value={[config.noiseVar]}
+                        onValueChange={([v]) => updateConfig('noiseVar', v)}
+                        min={0.01} max={0.5} step={0.01}
+                      />
+                    </div>
+                  )}
                 </CardContent>
               </Card>
             </TabsContent>
@@ -643,29 +683,27 @@ export function AugmentationView({
                       <Label>Mosaic</Label>
                       <p className="text-xs text-muted-foreground">Combine 4 images into a grid</p>
                     </div>
-                    <Switch 
+                    <Switch
                       checked={config.mosaic}
                       onCheckedChange={(v) => updateConfig('mosaic', v)}
                     />
                   </div>
-
                   <div className="flex items-center justify-between">
                     <div>
                       <Label>Mixup</Label>
                       <p className="text-xs text-muted-foreground">Blend two images together</p>
                     </div>
-                    <Switch 
+                    <Switch
                       checked={config.mixup}
                       onCheckedChange={(v) => updateConfig('mixup', v)}
                     />
                   </div>
-
                   <div className="flex items-center justify-between">
                     <div>
                       <Label>Cutout</Label>
                       <p className="text-xs text-muted-foreground">Random rectangular occlusion</p>
                     </div>
-                    <Switch 
+                    <Switch
                       checked={config.cutout}
                       onCheckedChange={(v) => updateConfig('cutout', v)}
                     />
@@ -685,62 +723,192 @@ export function AugmentationView({
                 <CardContent className="space-y-4">
                   <div className="space-y-2">
                     <Label>Output Dataset Name</Label>
-                    <Input 
+                    <Input
                       value={outputName}
                       onChange={(e) => setOutputName(e.target.value)}
                       placeholder="Augmented dataset name"
                     />
                   </div>
 
-                  <div className="space-y-2">
-                    <div className="flex items-center justify-between">
-                      <Label>Augmentation Factor</Label>
-                      <span className="text-sm text-muted-foreground">{augmentFactor}x</span>
+                  {/* Size mode toggle */}
+                  <div className="space-y-3">
+                    <Label>Target Size</Label>
+                    <div className="flex gap-2">
+                      <button
+                        onClick={() => setSizeMode('factor')}
+                        className="flex-1 px-3 py-1.5 text-sm rounded-md border transition-colors"
+                        style={{
+                          borderColor: sizeMode === 'factor' ? '#00d4b4' : undefined,
+                          color: sizeMode === 'factor' ? '#00d4b4' : undefined,
+                          backgroundColor: sizeMode === 'factor' ? 'rgba(0,212,180,0.08)' : 'transparent'
+                        }}
+                      >
+                        Multiplier
+                      </button>
+                      <button
+                        onClick={() => setSizeMode('absolute')}
+                        className="flex-1 px-3 py-1.5 text-sm rounded-md border transition-colors"
+                        style={{
+                          borderColor: sizeMode === 'absolute' ? '#00d4b4' : undefined,
+                          color: sizeMode === 'absolute' ? '#00d4b4' : undefined,
+                          backgroundColor: sizeMode === 'absolute' ? 'rgba(0,212,180,0.08)' : 'transparent'
+                        }}
+                      >
+                        Absolute Size
+                      </button>
                     </div>
-                    <Slider
-                      value={[augmentFactor]}
-                      onValueChange={([v]) => setAugmentFactor(v)}
-                      min={1}
-                      max={10}
-                      step={1}
-                    />
-                    <p className="text-xs text-muted-foreground">
-                      Each image will generate {augmentFactor} augmented versions.
-                      Total output: ~{selectedDataset.num_images * augmentFactor} images
-                    </p>
+
+                    {sizeMode === 'factor' ? (
+                      <div className="space-y-2">
+                        <div className="flex items-center gap-2">
+                          <Input
+                            type="number"
+                            value={factorInput}
+                            min={1.1}
+                            max={20}
+                            step={0.1}
+                            className="w-24"
+                            onChange={(e) => {
+                              setFactorInput(e.target.value)
+                              const v = parseFloat(e.target.value)
+                              if (!isNaN(v) && v >= 1.1) setAugmentFactor(v)
+                            }}
+                          />
+                          <span className="text-sm text-muted-foreground">× multiplier</span>
+                        </div>
+                        <Slider
+                          value={[augmentFactor]}
+                          onValueChange={([v]) => { setAugmentFactor(v); setFactorInput(String(v)) }}
+                          min={1.1}
+                          max={10}
+                          step={0.1}
+                        />
+                        <p className="text-xs text-muted-foreground">
+                          {selectedDataset.num_images} → ~{computedTargetSize} images ({augmentFactor.toFixed(1)}×)
+                        </p>
+                      </div>
+                    ) : (
+                      <div className="space-y-2">
+                        <div className="flex items-center gap-2">
+                          <Input
+                            type="number"
+                            value={targetSize || ''}
+                            min={selectedDataset.num_images}
+                            placeholder={String(selectedDataset.num_images * 2)}
+                            onChange={(e) => setTargetSize(parseInt(e.target.value) || 0)}
+                          />
+                          <span className="text-sm text-muted-foreground">images</span>
+                        </div>
+                        <p className="text-xs text-muted-foreground">
+                          Current: {selectedDataset.num_images} images
+                          {targetSize > 0 && ` → ${targetSize} images (${(targetSize / selectedDataset.num_images).toFixed(2)}×)`}
+                        </p>
+                      </div>
+                    )}
                   </div>
+                </CardContent>
+              </Card>
+
+              {/* Class-based augmentation */}
+              <Card>
+                <CardHeader className="pb-3">
+                  <CardTitle className="text-base flex items-center gap-2">
+                    <Users className="w-4 h-4" />
+                    Class Balancing
+                  </CardTitle>
+                  <CardDescription>
+                    Set per-class targets to reduce class imbalance
+                  </CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-3">
+                  <div className="flex items-center justify-between">
+                    <Label>Enable per-class targets</Label>
+                    <Switch
+                      checked={classAugEnabled}
+                      onCheckedChange={setClassAugEnabled}
+                    />
+                  </div>
+                  {classAugEnabled && (
+                    <div className="space-y-2">
+                      {datasetClasses.length === 0 ? (
+                        <p className="text-xs text-muted-foreground">No class information available for this dataset.</p>
+                      ) : (
+                        datasetClasses.map((cls) => (
+                          <div key={cls} className="flex items-center gap-3">
+                            <span className="text-sm flex-1 truncate">{cls}</span>
+                            <Input
+                              type="number"
+                              className="w-24"
+                              placeholder="target"
+                              value={classTargets[cls] ?? ''}
+                              onChange={(e) => {
+                                const v = parseInt(e.target.value)
+                                setClassTargets(prev => ({
+                                  ...prev,
+                                  [cls]: isNaN(v) ? 0 : v
+                                }))
+                              }}
+                            />
+                            <span className="text-xs text-muted-foreground w-14">images</span>
+                          </div>
+                        ))
+                      )}
+                      <p className="text-xs text-muted-foreground pt-1">
+                        Leave blank to use global target size for that class.
+                      </p>
+                    </div>
+                  )}
                 </CardContent>
               </Card>
             </TabsContent>
           </Tabs>
         </div>
 
+        {/* Preview panel */}
         <Card className="w-80 flex-shrink-0">
           <CardHeader>
-            <CardTitle className="text-base">Preview</CardTitle>
-            <CardDescription>See how augmentations will look</CardDescription>
+            <CardTitle className="text-base flex items-center gap-2">
+              <Target className="w-4 h-4" />
+              Preview
+            </CardTitle>
+            <CardDescription>Augmented samples — each with random combination</CardDescription>
           </CardHeader>
           <CardContent>
-            <div className="aspect-square bg-muted rounded-lg flex items-center justify-center overflow-hidden">
-              {previewLoading ? (
+            {previewLoading ? (
+              <div className="flex items-center justify-center h-48">
                 <RefreshCcw className="w-8 h-8 text-muted-foreground animate-spin" />
-              ) : previewImage ? (
-                <img 
-                  src={previewImage} 
-                  alt="Augmentation preview"
-                  className="w-full h-full object-contain"
-                />
-              ) : (
-                <div className="text-center p-4">
-                  <Eye className="w-8 h-8 text-muted-foreground mx-auto mb-2" />
-                  <p className="text-sm text-muted-foreground">
-                    Click Preview to see augmented samples
-                  </p>
-                </div>
-              )}
-            </div>
-            <Button 
-              variant="outline" 
+              </div>
+            ) : previews.length > 0 ? (
+              <div className="grid grid-cols-2 gap-2">
+                {previews.map((p, i) => (
+                  <div key={i} className="space-y-1">
+                    <div className="aspect-square bg-muted rounded overflow-hidden">
+                      {p.data_url ? (
+                        <img src={p.data_url} alt={`Preview ${i + 1}`} className="w-full h-full object-cover" />
+                      ) : (
+                        <div className="w-full h-full flex items-center justify-center">
+                          <Eye className="w-5 h-5 text-muted-foreground" />
+                        </div>
+                      )}
+                    </div>
+                    {p.augmentations.length > 0 && (
+                      <p className="text-[10px] text-muted-foreground leading-tight truncate" title={p.augmentations.join(', ')}>
+                        {p.augmentations.join(', ')}
+                      </p>
+                    )}
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="flex flex-col items-center justify-center h-48 text-center">
+                <Eye className="w-8 h-8 text-muted-foreground mb-2" />
+                <p className="text-sm text-muted-foreground">
+                  Click Generate Preview to see augmented samples
+                </p>
+              </div>
+            )}
+            <Button
+              variant="outline"
               className="w-full mt-4"
               onClick={handlePreview}
               disabled={previewLoading}

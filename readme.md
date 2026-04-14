@@ -1,4 +1,6 @@
-# CV Dataset Manager
+![Hero Screenshot](assets/images/hero.png)
+
+# VisOS
 
 > **The all-in-one local workbench for computer vision datasets.** Annotate, convert, augment, merge, and train — without touching a single cloud service or writing a line of code.
 
