@@ -70,7 +70,7 @@ class AnnotationManager:
             manifests_dir = dataset_path.parent / ".manifests"
             manifests_dir.mkdir(parents=True, exist_ok=True)
             return manifests_dir / f"{dataset_id}.annotations.json"
-        return dataset_path / ".visos_annotations.json"
+        return dataset_path / ".opensamannotator_annotations.json"
 
     def _update_generic_annotations(
         self,

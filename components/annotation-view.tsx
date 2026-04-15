@@ -338,10 +338,10 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
       fd.append('model_type', model.type)
       fd.append('pretrained', model.id)
       // Gated HuggingFace models (SAM 3 / SAM 3.1) need a token. Reuse the
-      // one the user pasted on the Models page — stored under visos.hf_token.
+      // one the user pasted on the Models page — stored under opensamannotator.hf_token.
       try {
         const stored = typeof window !== 'undefined'
-          ? window.localStorage.getItem('visos.hf_token')
+          ? window.localStorage.getItem('opensamannotator.hf_token')
           : null
         if (stored) fd.append('hf_token', stored)
       } catch {}

@@ -1,5 +1,5 @@
 """
-CV Dataset Manager - Main FastAPI Application
+OpenSAMAnnotator - Main FastAPI Application
 A comprehensive tool for managing computer vision datasets
 """
 
@@ -105,7 +105,7 @@ def _generic_annotations_path(dataset_id: str, dataset_path: Path) -> Path:
     """
     if dataset_path.is_symlink():
         return MANIFESTS_DIR / f"{dataset_id}.annotations.json"
-    return dataset_path / ".visos_annotations.json"
+    return dataset_path / ".opensamannotator_annotations.json"
 
 
 def _load_generic_sidecar(dataset_id: str, dataset_path: Path) -> Dict[str, List[Dict[str, Any]]]:
@@ -261,8 +261,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="CV Dataset Manager",
-    description="Professional Computer Vision Dataset Management Suite",
+    title="OpenSAMAnnotator",
+    description="OpenSAMAnnotator — local computer vision dataset workbench",
     version="3.0.0",
     lifespan=lifespan,
 )
@@ -274,7 +274,7 @@ async def root():
     """Root endpoint — confirms the API is reachable and surfaces discovery links."""
     return {
         "status": "running",
-        "name": "CV Dataset Manager API",
+        "name": "OpenSAMAnnotator API",
         "version": "3.0.0",
         "docs": "/docs",
         "health": "/api/health",

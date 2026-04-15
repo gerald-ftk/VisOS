@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-VisOS launcher.
+OpenSAMAnnotator launcher.
 
 Run with `uv run app.py` from the project root. Starts:
   • FastAPI backend  → http://localhost:8000
@@ -186,7 +186,7 @@ def kill_proc(proc: subprocess.Popen, name: str) -> None:
 
 
 def main() -> int:
-    print(f"\n{BOLD}{C}VisOS — launching…{W}\n")
+    print(f"\n{BOLD}{C}OpenSAMAnnotator — launching…{W}\n")
 
     backend = start_backend()
     frontend = start_frontend()

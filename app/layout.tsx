@@ -6,7 +6,7 @@ import { Toaster } from '@/components/ui/sonner'
 import './globals.css'
 
 export const metadata: Metadata = {
-  title: 'VisOS',
+  title: 'OpenSAMAnnotator',
   description: 'Locally-run image annotation tool with SAM 3 / SAM 3.1 support',
   keywords: ['computer vision', 'dataset', 'annotation', 'sam', 'sam3', 'segmentation'],
 }

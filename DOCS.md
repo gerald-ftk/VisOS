@@ -1,4 +1,4 @@
-# VisOS — Complete Documentation
+# OpenSAMAnnotator — Complete Documentation
 
 ## Table of Contents
 
@@ -80,7 +80,7 @@
 
 ### Supported Formats
 
-VisOS auto-detects all of the following on load, and can export to all of them:
+OpenSAMAnnotator auto-detects all of the following on load, and can export to all of them:
 
 | Format | Notes |
 |---|---|
@@ -647,4 +647,4 @@ Check that the file isn't corrupted and that you have sufficient GPU memory. Try
 
 ---
 
-*VisOS Documentation*
+*OpenSAMAnnotator Documentation*

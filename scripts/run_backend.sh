@@ -1,8 +1,8 @@
 #!/bin/bash
 
-# CV Dataset Manager - Backend Startup Script
+# OpenSAMAnnotator - Backend Startup Script
 
-echo "Starting CV Dataset Manager Backend..."
+echo "Starting OpenSAMAnnotator Backend..."
 
 # Navigate to backend directory
 cd "$(dirname "$0")/../backend"

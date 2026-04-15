@@ -63,7 +63,7 @@ const PRETRAINED_CATALOG: Array<{
 
 // Shared localStorage key for the HuggingFace token so both the Models and
 // Annotate views can reuse it when downloading gated checkpoints.
-const HF_TOKEN_KEY = "visos.hf_token"
+const HF_TOKEN_KEY = "opensamannotator.hf_token"
 
 export function ModelsView({ apiUrl = "http://localhost:8000" }: ModelsViewProps) {
   const [models, setModels] = useState<BackendModel[]>([])

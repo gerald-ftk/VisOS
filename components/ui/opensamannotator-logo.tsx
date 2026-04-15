@@ -2,12 +2,12 @@
 
 import { useEffect, useRef, useState } from "react"
 
-interface VisosLogoProps {
+interface OpenSAMAnnotatorLogoProps {
   size?: number
   showText?: boolean
 }
 
-export function VisosLogo({ size = 200, showText = true }: VisosLogoProps) {
+export function OpenSAMAnnotatorLogo({ size = 200, showText = true }: OpenSAMAnnotatorLogoProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const [rotation, setRotation] = useState(0)
   const currentRotationRef = useRef(0)
@@ -64,7 +64,7 @@ export function VisosLogo({ size = 200, showText = true }: VisosLogoProps) {
     return () => window.removeEventListener("mousemove", handleMouseMove)
   }, [])
 
-  const textSize = size * 0.32
+  const textSize = size * 0.12
 
   return (
     <div
@@ -122,20 +122,22 @@ export function VisosLogo({ size = 200, showText = true }: VisosLogoProps) {
         />
       </svg>
 
-      {/* VisOS text */}
+      {/* OpenSAMAnnotator text */}
       {showText && (
         <div
           style={{
             display: "flex",
             alignItems: "center",
+            whiteSpace: "nowrap",
             fontFamily: fontLoaded ? "'Syne', sans-serif" : "system-ui, sans-serif",
             fontSize: textSize,
             fontWeight: 800,
             letterSpacing: "-0.025em",
           }}
         >
-          <span style={{ color: "white" }}>Vis</span>
-          <span style={{ color: "#00D4B4" }}>OS</span>
+          <span style={{ color: "white" }}>Open</span>
+          <span style={{ color: "#00D4B4" }}>SAM</span>
+          <span style={{ color: "white" }}>Annotator</span>
         </div>
       )}
     </div>

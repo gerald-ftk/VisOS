@@ -1,8 +1,8 @@
 ![Hero Screenshot](assets/images/hero.png)
 
-# VisOS
+# OpenSAMAnnotator
 
-VisOS is a locally-run image annotation tool. No accounts, no uploads, no cloud service. Built around SAM 3 / SAM 3.1 for AI-assisted segmentation.
+OpenSAMAnnotator is a locally-run image annotation tool. No accounts, no uploads, no cloud service. Built around SAM 3 / SAM 3.1 for AI-assisted segmentation.
 
 ---
 
@@ -15,8 +15,8 @@ VisOS is a locally-run image annotation tool. No accounts, no uploads, no cloud 
 **Prerequisites:** Python 3.10+, Node.js 18+, [uv](https://docs.astral.sh/uv/)
 
 ```bash
-git clone https://github.com/Dan04ggg/VisOS.git
-cd VisOS
+git clone https://github.com/gerald-ftk/OpenSAMAnnotator.git
+cd OpenSAMAnnotator
 uv run app.py
 ```
 
@@ -180,7 +180,7 @@ No required environment variables for local use. Backend URL defaults to `http:/
 ## Architecture
 
 ```
-VisOS/
+OpenSAMAnnotator/
 ├── app.py                    # uv-based launcher (backend + frontend)
 ├── pyproject.toml            # uv dependency manifest
 ├── backend/

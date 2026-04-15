@@ -1,10 +1,10 @@
 @echo off
-REM CV Dataset Manager - Backend Startup Script (Windows)
+REM OpenSAMAnnotator - Backend Startup Script (Windows)
 setlocal enabledelayedexpansion
 
 echo.
 echo ========================================
-echo   CV Dataset Manager - Backend Setup
+echo   OpenSAMAnnotator - Backend Setup
 echo ========================================
 echo.
 

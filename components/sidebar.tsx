@@ -1,7 +1,7 @@
 'use client'
 
 import { cn } from '@/lib/utils'
-import { VisosLogo } from "@/components/ui/visos-logo"
+import { OpenSAMAnnotatorLogo } from "@/components/ui/opensamannotator-logo"
 import {
   Settings,
   Database,
@@ -185,7 +185,7 @@ export function Sidebar({ activeView, setActiveView, selectedDataset }: SidebarP
 
       {/* Brand */}
       <div className="relative px-5 pt-5 pb-4">
-        <VisosLogo size={100} showText={true} />
+        <OpenSAMAnnotatorLogo size={100} showText={true} />
       </div>
 
       {/* Active dataset pill */}
