@@ -388,14 +388,26 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
     }
   }
 
+  // Switch tools while clearing any in-progress prompt state. Without this,
+  // clicking polygon after placing SAM points would leave the yellow dots on
+  // the canvas, and half-drawn boxes/keypoints would linger into the next tool.
+  const switchTool = useCallback((next: Tool) => {
+    setActiveTool(next)
+    setPolygonPoints([])
+    setSamPoints([])
+    setTempBox(null)
+    setKeypointList([])
+    setIsDrawing(false)
+  }, [])
+
   // Auto-switch to SAM wand when a SAM model is selected
   useEffect(() => {
     if (!selectedModel) return
     const m = models.find(m => m.id === selectedModel)
     if (m && (m.type === 'sam' || m.type === 'sam2' || m.type === 'sam3')) {
-      setActiveTool('sam')
+      switchTool('sam')
     }
-  }, [selectedModel])
+  }, [selectedModel, switchTool])
 
   // ── Load a single image file (fast — just one HTTP request) ─────────────────
   const loadImageFile = useCallback(async (imgData: ImageData) => {
@@ -479,6 +491,20 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
     ctx.drawImage(img, 0, 0, canvas.width, canvas.height)
 
     const COLORS = ['#3b82f6', '#22c55e', '#f59e0b', '#ef4444', '#8b5cf6', '#06b6d4']
+    // Convert "#rrggbb" → "rgba(r,g,b,a)". We don't rely on 8-digit hex alpha
+    // because a stray invalid color (e.g. from a negative class_id) silently
+    // leaves fillStyle at canvas' default #000000 and paints the whole
+    // annotation solid black.
+    const rgba = (hex: string, alpha: number) => {
+      const r = parseInt(hex.slice(1, 3), 16)
+      const g = parseInt(hex.slice(3, 5), 16)
+      const b = parseInt(hex.slice(5, 7), 16)
+      return `rgba(${r},${g},${b},${alpha})`
+    }
+    const classColor = (classId: number | undefined) => {
+      const idx = classId != null && classId >= 0 ? classId : 0
+      return COLORS[idx % COLORS.length]
+    }
 
     const drawLabel = (ctx: CanvasRenderingContext2D, text: string, x: number, y: number, color: string) => {
       ctx.font = 'bold 12px sans-serif'
@@ -491,10 +517,10 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
 
     anns.forEach((ann, idx) => {
       const isSel = idx === selectedIdx
-      const color = isSel ? '#22c55e' : COLORS[(ann.class_id || 0) % COLORS.length]
+      const color = isSel ? '#22c55e' : classColor(ann.class_id)
       ctx.strokeStyle = color
       ctx.lineWidth = isSel ? 3 : 2
-      ctx.fillStyle = color + (isSel ? '40' : '20')
+      ctx.fillStyle = rgba(color, isSel ? 0.25 : 0.12)
 
       if (ann.bbox && ann.bbox.length === 4) {
         const [x, y, w, h] = ann.bbox
@@ -894,20 +920,42 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
     setPolygonPoints([])
   }, [polygonPoints, annotations, activeClass, selectedDataset])
 
+  // Even-odd ray-cast point-in-polygon test. Accepts a flat [x,y,x,y,...] list.
+  const pointInPolygon = (x: number, y: number, flat: number[]) => {
+    let inside = false
+    const n = Math.floor(flat.length / 2)
+    for (let i = 0, j = n - 1; i < n; j = i++) {
+      const xi = flat[i * 2], yi = flat[i * 2 + 1]
+      const xj = flat[j * 2], yj = flat[j * 2 + 1]
+      const intersect = (yi > y) !== (yj > y) && x < ((xj - xi) * (y - yi)) / (yj - yi + 1e-12) + xi
+      if (intersect) inside = !inside
+    }
+    return inside
+  }
+
   const handleAnnotationClick = (coords: { x: number; y: number }) => {
     const scale = scaleRef.current
     const imgX = coords.x / scale, imgY = coords.y / scale
+    const img = imageRef.current
+    const iw = img?.width || 1, ih = img?.height || 1
     for (let i = annotations.length - 1; i >= 0; i--) {
       const ann = annotations[i]
       if (ann.bbox && ann.bbox.length === 4) {
         const [x, y, w, h] = ann.bbox
         if (imgX >= x && imgX <= x + w && imgY >= y && imgY <= y + h) { setSelectedAnnotation(i); return }
       } else if (ann.x_center !== undefined) {
-        const img = imageRef.current
-        const iw = img?.width || 1, ih = img?.height || 1
         const cx = ann.x_center * iw, cy = (ann.y_center || 0) * ih
         const w = ann.width! * iw, h = (ann.height || 0) * ih
         if (imgX >= cx - w/2 && imgX <= cx + w/2 && imgY >= cy - h/2 && imgY <= cy + h/2) { setSelectedAnnotation(i); return }
+      } else if (ann.points && ann.points.length >= 6) {
+        // Polygon — may be normalized (0–1) or in pixel coordinates, same
+        // detection rule as the draw code at drawCanvasWithData.
+        const pts = ann.points
+        const isNorm = ann.normalized || pts.every(p => p >= 0 && p <= 1)
+        const denorm = isNorm
+          ? pts.map((v, k) => (k % 2 === 0 ? v * iw : v * ih))
+          : pts
+        if (pointInPolygon(imgX, imgY, denorm)) { setSelectedAnnotation(i); return }
       }
     }
     setSelectedAnnotation(null)
@@ -1236,12 +1284,12 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
         else if (keypointList.length > 0) commitKeypoints()
       }
       // Tool shortcuts
-      if (e.key === 'v') setActiveTool('select')
-      if (e.key === 'b') setActiveTool('bbox')
-      if (e.key === 'p') { setActiveTool('polygon'); setPolygonPoints([]) }
-      if (e.key === 'k') setActiveTool('keypoint')
-      if (e.key === 'r') setActiveTool('brush')
-      if (e.key === 'q') setActiveTool('sam')
+      if (e.key === 'v') switchTool('select')
+      if (e.key === 'b') switchTool('bbox')
+      if (e.key === 'p') switchTool('polygon')
+      if (e.key === 'k') switchTool('keypoint')
+      if (e.key === 'r') switchTool('brush')
+      if (e.key === 'q') switchTool('sam')
       // 1-9 class assignment shortcuts
       const num = parseInt(e.key)
       if (!isNaN(num) && num >= 1 && num <= 9 && localClasses.length > 0) {
@@ -1265,7 +1313,7 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentIndex, filteredImages, selectedAnnotation, annotations, polygonPoints, keypointList, selectedDataset, navigateImage, localClasses])
+  }, [currentIndex, filteredImages, selectedAnnotation, annotations, polygonPoints, keypointList, selectedDataset, navigateImage, localClasses, switchTool])
 
   // ── Empty state ──────────────────────────────────────────────────────────────
   if (!selectedDataset) {
@@ -1337,27 +1385,33 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
         <div className="flex items-center gap-2 p-2 border-b border-border bg-card flex-wrap">
           {/* Drawing tools */}
           <div className="flex items-center gap-1">
-            <Button size="sm" variant={activeTool === 'select' ? 'default' : 'outline'} onClick={() => setActiveTool('select')} title="Select (V)">
+            <Button size="sm" variant={activeTool === 'select' ? 'default' : 'outline'} onClick={() => switchTool('select')} title="Select (V)">
               <MousePointer2 className="w-4 h-4" />
+              <span className="ml-1 text-[10px] font-mono opacity-70">V</span>
             </Button>
-            <Button size="sm" variant={activeTool === 'bbox' ? 'default' : 'outline'} onClick={() => setActiveTool('bbox')} title="Bounding Box (B)">
+            <Button size="sm" variant={activeTool === 'bbox' ? 'default' : 'outline'} onClick={() => switchTool('bbox')} title="Bounding Box (B)">
               <Square className="w-4 h-4" />
+              <span className="ml-1 text-[10px] font-mono opacity-70">B</span>
             </Button>
             <Button size="sm" variant={activeTool === 'polygon' ? 'default' : 'outline'}
-              onClick={() => { setActiveTool('polygon'); setPolygonPoints([]) }} title="Polygon (P)">
+              onClick={() => switchTool('polygon')} title="Polygon (P)">
               <Pentagon className="w-4 h-4" />
+              <span className="ml-1 text-[10px] font-mono opacity-70">P</span>
             </Button>
             <Button size="sm" variant={activeTool === 'keypoint' ? 'default' : 'outline'}
-              onClick={() => { setActiveTool('keypoint'); setKeypointList([]) }} title="Keypoints (K)">
+              onClick={() => switchTool('keypoint')} title="Keypoints (K)">
               <Crosshair className="w-4 h-4" />
+              <span className="ml-1 text-[10px] font-mono opacity-70">K</span>
             </Button>
             <Button size="sm" variant={activeTool === 'brush' ? 'default' : 'outline'}
-              onClick={() => setActiveTool('brush')} title="Brush / Paint mask (R)">
+              onClick={() => switchTool('brush')} title="Brush / Paint mask (R)">
               <Brush className="w-4 h-4" />
+              <span className="ml-1 text-[10px] font-mono opacity-70">R</span>
             </Button>
             <Button size="sm" variant={activeTool === 'sam' ? 'default' : 'outline'}
-              onClick={() => setActiveTool('sam')} title="SAM click-to-segment (Q)">
+              onClick={() => switchTool('sam')} title="SAM click-to-segment (Q)">
               {isSamLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Wand2 className="w-4 h-4" />}
+              <span className="ml-1 text-[10px] font-mono opacity-70">Q</span>
             </Button>
           </div>
 
