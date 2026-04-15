@@ -23,11 +23,18 @@ class AnnotationManager:
         dataset_path: Path,
         format_name: str,
         image_id: str,
-        annotations: List[Dict[str, Any]]
+        annotations: List[Dict[str, Any]],
+        dataset_id: Optional[str] = None,
     ):
-        """Update annotations for a specific image"""
+        """Update annotations for a specific image.
+
+        dataset_id is needed for formats that have no on-disk label store
+        (e.g. generic-images), because we redirect their sidecar into the
+        manifests directory when the dataset root is a symlink into the
+        user's source folder — otherwise we'd pollute their source dir.
+        """
         dataset_path = Path(dataset_path)
-        
+
         updaters = {
             "yolo": self._update_yolo_annotations,
             "yolov5": self._update_yolo_annotations,
@@ -41,10 +48,63 @@ class AnnotationManager:
             "voc": self._update_voc_annotations,
             "labelme": self._update_labelme_annotations,
         }
-        
-        updater = updaters.get(format_name)
-        if updater:
-            updater(dataset_path, image_id, annotations)
+
+        # generic-images has no on-disk annotation format, so we write to a
+        # JSON sidecar instead. Same for any unknown format — we fall back
+        # to the sidecar so the user never loses work.
+        if format_name == "generic-images" or format_name not in updaters:
+            self._update_generic_annotations(dataset_path, image_id, annotations, dataset_id)
+            return
+
+        updaters[format_name](dataset_path, image_id, annotations)
+
+    def _generic_sidecar_path(self, dataset_path: Path, dataset_id: Optional[str]) -> Path:
+        """Pick where a generic-images annotation sidecar should live.
+
+        For local-folder datasets we never touch the user's source directory,
+        even though the symlink would let us: we redirect the sidecar into
+        `<DATASETS_DIR>/.manifests/<id>.annotations.json` instead. For real
+        directories created by upload, the sidecar lives inside the dataset.
+        """
+        if dataset_path.is_symlink() and dataset_id:
+            manifests_dir = dataset_path.parent / ".manifests"
+            manifests_dir.mkdir(parents=True, exist_ok=True)
+            return manifests_dir / f"{dataset_id}.annotations.json"
+        return dataset_path / ".visos_annotations.json"
+
+    def _update_generic_annotations(
+        self,
+        dataset_path: Path,
+        image_id: str,
+        annotations: List[Dict[str, Any]],
+        dataset_id: Optional[str],
+    ):
+        """Write annotations to the generic-images JSON sidecar.
+
+        Shape: { "<image_id>": [ann, ...], ... }. Read-modify-write under
+        the assumption that FastAPI serves one request at a time per worker;
+        concurrent writers on the same dataset are not expected here.
+        """
+        sidecar = self._generic_sidecar_path(dataset_path, dataset_id)
+        try:
+            data: Dict[str, Any] = {}
+            if sidecar.exists():
+                with open(sidecar) as f:
+                    data = json.load(f) or {}
+                if not isinstance(data, dict):
+                    data = {}
+            if annotations:
+                # Strip Pydantic model wrappers if the caller passed them.
+                data[image_id] = [
+                    a.dict() if hasattr(a, "dict") else a for a in annotations
+                ]
+            else:
+                data.pop(image_id, None)
+            sidecar.parent.mkdir(parents=True, exist_ok=True)
+            with open(sidecar, "w") as f:
+                json.dump(data, f, indent=2, default=str)
+        except Exception as exc:
+            print(f"[annotations] Could not write generic sidecar {sidecar}: {exc}")
     
     def _find_dataset_root(self, path: Path) -> Path:
         """Descend into single-child directories (handles ZIP-extracted nesting)."""
@@ -84,13 +144,26 @@ class AnnotationManager:
         with Image.open(image_file) as img:
             width, height = img.size
 
-        # Label file lives beside the image but in a sibling "labels" folder
-        # e.g. root/train/images/foo.jpg  →  root/train/labels/foo.txt
-        img_parent = image_file.parent
-        if img_parent.name == "images":
-            label_dir = img_parent.parent / "labels"
-        else:
-            label_dir = img_parent.parent / "labels"
+        # Mirror the image's split/images folder into a sibling labels folder.
+        # Works for flat, nested, and multi-depth layouts:
+        #   root/x.jpg                     → root/labels/x.txt
+        #   root/train/images/x.jpg        → root/train/labels/x.txt
+        #   root/myds/train/images/x.jpg   → root/myds/train/labels/x.txt
+        # The previous code hardcoded `img_parent.parent / "labels"`, which
+        # escapes the dataset root on flat layouts (writing next to it, not
+        # inside it) and wastes the branch on `img_parent.name == "images"`.
+        try:
+            rel_parts = image_file.relative_to(root).parts
+            img_idx = next(
+                (i for i, p in enumerate(rel_parts) if p.lower() in ("images", "imgs")),
+                None,
+            )
+            if img_idx is not None:
+                label_dir = root.joinpath(*rel_parts[:img_idx]) / "labels"
+            else:
+                raise ValueError("no 'images' segment in path")
+        except Exception:
+            label_dir = root / "labels"
         label_dir.mkdir(parents=True, exist_ok=True)
         label_file = label_dir / f"{image_id}.txt"
 

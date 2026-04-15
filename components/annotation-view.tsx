@@ -705,6 +705,17 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
     // Normalize coordinates
     const px = coords.x / scale / img.width
     const py = coords.y / scale / img.height
+
+    // The backend returns every SAM mask tagged as "object" / class_id 0.
+    // That's not what the user wants — they want the currently active class
+    // (the one selected in the class picker, same as for manual bboxes).
+    // Override the class fields before inserting, and pick an id that
+    // matches the user's own class list so YOLO export maps correctly.
+    const resolvedClass = activeClass || localClasses[0] || 'object'
+    const resolvedClassId = Math.max(0, localClasses.indexOf(resolvedClass))
+    const tagAnnotations = (anns: Annotation[]): Annotation[] =>
+      anns.map(a => ({ ...a, class_name: resolvedClass, class_id: resolvedClassId }))
+
     try {
       const params = new URLSearchParams({
         model_id: selectedModel,
@@ -717,14 +728,23 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
         `${apiUrl}/api/auto-annotate/${selectedDataset.id}/single/${currentImage.id}?${params}`,
         { method: 'POST' }
       )
-      if (!resp.ok) throw new Error('SAM failed')
+      if (!resp.ok) {
+        // Surface the real backend message (e.g. gated HF token or text
+        // stage error) rather than a generic "SAM failed".
+        let detail = 'SAM failed'
+        try {
+          const errJson = await resp.json()
+          if (errJson?.detail) detail = errJson.detail
+        } catch {}
+        throw new Error(detail)
+      }
       const data = await resp.json()
       if (data.annotations?.length) {
-        const next = [...annotationsRef.current, ...data.annotations]
+        const next = [...annotationsRef.current, ...tagAnnotations(data.annotations)]
         setAnnotations(next)
         saveToHistory(next)
         await saveAnnotations(false, next)
-        toast.success(`SAM generated ${data.annotations.length} mask(s)`)
+        toast.success(`SAM generated ${data.annotations.length} mask(s) as "${resolvedClass}"`)
       } else {
         // Fallback: just run standard auto-annotate
         const fbParams = new URLSearchParams({ model_id: selectedModel, confidence_threshold: String(confidence) })
@@ -735,17 +755,17 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
         )
         const fallbackData = await fallbackResp.json()
         if (fallbackData.annotations?.length) {
-          const next = [...annotationsRef.current, ...fallbackData.annotations]
+          const next = [...annotationsRef.current, ...tagAnnotations(fallbackData.annotations)]
           setAnnotations(next)
           saveToHistory(next)
           await saveAnnotations(false, next)
-          toast.success('Auto-annotated (SAM point not supported by this model)')
+          toast.success(`Auto-annotated as "${resolvedClass}" (SAM point not supported by this model)`)
         } else {
           toast.info('No objects detected at that point')
         }
       }
-    } catch {
-      toast.error('SAM annotation failed')
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'SAM annotation failed')
     } finally {
       setIsSamLoading(false)
     }

@@ -87,11 +87,55 @@ def _save_dataset_metadata(dataset_id: str, info: dict):
 
 
 def _delete_dataset_metadata(dataset_id: str):
-    """Remove the manifest sidecar, if present."""
+    """Remove the dataset manifest and its annotations sidecar, if present."""
     try:
         _manifest_path(dataset_id).unlink(missing_ok=True)
     except Exception as exc:
         logger.warning("Could not delete manifest for dataset %s: %s", dataset_id, exc)
+    try:
+        (MANIFESTS_DIR / f"{dataset_id}.annotations.json").unlink(missing_ok=True)
+    except Exception as exc:
+        logger.warning("Could not delete annotations sidecar for dataset %s: %s", dataset_id, exc)
+
+
+def _generic_annotations_path(dataset_id: str, dataset_path: Path) -> Path:
+    """Where the generic-images JSON sidecar lives for this dataset.
+
+    Matches AnnotationManager._generic_sidecar_path: symlinked (local-
+    folder) datasets redirect their sidecar into the manifests directory;
+    real directories get a hidden file inside the dataset root.
+    """
+    if dataset_path.is_symlink():
+        return MANIFESTS_DIR / f"{dataset_id}.annotations.json"
+    return dataset_path / ".visos_annotations.json"
+
+
+def _load_generic_sidecar(dataset_id: str, dataset_path: Path) -> Dict[str, List[Dict[str, Any]]]:
+    """Load {image_id: [ann, ...]} for a generic-images dataset, or {}."""
+    sidecar = _generic_annotations_path(dataset_id, dataset_path)
+    if not sidecar.exists():
+        return {}
+    try:
+        with open(sidecar) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception as exc:
+        logger.warning("Could not read generic sidecar %s: %s", sidecar, exc)
+        return {}
+
+
+def _merge_generic_annotations(
+    dataset_id: str, dataset_path: Path, images: List[Dict[str, Any]]
+) -> None:
+    """Attach sidecar-stored annotations onto parsed image records in place."""
+    sidecar = _load_generic_sidecar(dataset_id, dataset_path)
+    if not sidecar:
+        return
+    for img in images:
+        anns = sidecar.get(img["id"])
+        if anns:
+            img["annotations"] = anns
+            img["has_annotations"] = True
 
 
 def _restore_datasets():
@@ -109,15 +153,26 @@ def _restore_datasets():
         return
     restored = 0
 
-    # 1. Manifest-backed datasets
+    # 1. Manifest-backed datasets. The manifests directory now holds two
+    #    kinds of file: <id>.json (the dataset metadata) and
+    #    <id>.annotations.json (the generic-images annotation sidecar).
+    #    Only the first kind should drive restore — and the orphan prune
+    #    must not touch the second, or every reload wipes sidecars.
     if MANIFESTS_DIR.exists():
         for manifest in MANIFESTS_DIR.glob("*.json"):
+            if manifest.name.endswith(".annotations.json"):
+                continue
             dataset_id = manifest.stem
             entry = DATASETS_DIR / dataset_id
             if not entry.exists() and not entry.is_symlink():
-                # Backing path is gone — prune the orphaned manifest.
+                # Backing path is gone — prune the orphaned manifest and
+                # its matching annotations sidecar, if any.
                 try:
                     manifest.unlink()
+                except Exception:
+                    pass
+                try:
+                    (MANIFESTS_DIR / f"{dataset_id}.annotations.json").unlink(missing_ok=True)
                 except Exception:
                     pass
                 continue
@@ -857,10 +912,10 @@ async def add_classes_to_dataset(dataset_id: str, request: ClassAddRequest):
     """Add new classes to an existing dataset"""
     if dataset_id not in active_datasets:
         raise HTTPException(status_code=404, detail="Dataset not found")
-    
+
     dataset = active_datasets[dataset_id]
     dataset_path = DATASETS_DIR / dataset_id
-    
+
     if request.use_model and request.model_id:
         # Auto-annotate with new classes using model
         results = model_manager.annotate_with_new_classes(
@@ -870,18 +925,32 @@ async def add_classes_to_dataset(dataset_id: str, request: ClassAddRequest):
             request.new_classes
         )
     else:
-        # Just add classes to the dataset configuration
+        # Update format-specific config files when the format has one (YOLO
+        # yaml, COCO json). AnnotationManager.add_classes silently no-ops for
+        # formats without on-disk class storage (generic-images, labelme,
+        # ...), so we always fall through to the in-memory merge below.
         annotation_manager.add_classes(
             dataset_path,
             dataset["format"],
             request.new_classes
         )
         results = {"added_classes": request.new_classes}
-    
-    # Update dataset info
+
+    # Re-parse for fresh image/annotation counts, then merge requested
+    # classes on top. For unlabeled datasets the parser always returns
+    # classes=[], so this merge is the only place new classes get recorded.
     dataset_info = dataset_parser.parse_dataset(dataset_path, dataset["format"], dataset["name"])
+    existing_classes = list(dataset.get("classes") or [])
+    parsed_classes   = list(dataset_info.get("classes") or [])
+    requested        = [c for c in request.new_classes if c]
+    merged: List[str] = []
+    for name in (*parsed_classes, *existing_classes, *requested):
+        if name and name not in merged:
+            merged.append(name)
+    dataset_info["classes"] = merged
     dataset_info["id"] = dataset_id
     active_datasets[dataset_id] = dataset_info
+    _save_dataset_metadata(dataset_id, dataset_info)
     
     return {"success": True, "results": results, "updated_dataset": dataset_info}
 
@@ -913,7 +982,22 @@ async def get_dataset_classes(dataset_id: str):
 
     classes_list = dataset_parser.get_classes_with_distribution(dataset_path, dataset["format"])
     # Return as a plain dict {name: count} — simpler for frontend to consume
-    classes_dict = {item["name"]: item["count"] for item in classes_list}
+    classes_dict = {item["name"]: item["count"] for item in classes_list if item.get("name")}
+    # Surface in-memory classes (e.g. user-added on an unlabeled dataset)
+    # that don't show up in the on-disk distribution scan.
+    for name in (dataset.get("classes") or []):
+        if name and name not in classes_dict:
+            classes_dict[name] = 0
+    # For generic-images datasets also count sidecar annotations per class so
+    # the Classes page reflects the user's actual saved boxes instead of 0.
+    if dataset["format"] == "generic-images":
+        sidecar = _load_generic_sidecar(dataset_id, dataset_path)
+        for anns in sidecar.values():
+            for ann in anns:
+                name = ann.get("class_name")
+                if not name:
+                    continue
+                classes_dict[name] = classes_dict.get(name, 0) + 1
     return {"classes": classes_dict}
 
 
@@ -1329,6 +1413,11 @@ async def get_dataset_images(
             page=1,
             limit=999999
         )
+        # For generic-images datasets the parser returns empty annotations
+        # because there's no on-disk label store; merge the sidecar so the
+        # user's manual bboxes / SAM masks actually show up.
+        if dataset["format"] == "generic-images":
+            _merge_generic_annotations(dataset_id, dataset_path, all_images)
         _images_cache[dataset_id] = all_images
     else:
         all_images = _images_cache[dataset_id]
@@ -1362,11 +1451,19 @@ async def get_image_with_annotations(dataset_id: str, image_id: str):
     """Get a specific image with its annotations"""
     if dataset_id not in active_datasets:
         raise HTTPException(status_code=404, detail="Dataset not found")
-    
+
     dataset = active_datasets[dataset_id]
     dataset_path = DATASETS_DIR / dataset_id
-    
+
     image_data = dataset_parser.get_image_data(dataset_path, dataset["format"], image_id)
+    # For generic-images, the parser returns an empty annotation list — merge
+    # the sidecar-stored annotations for this one image.
+    if image_data and dataset["format"] == "generic-images":
+        sidecar = _load_generic_sidecar(dataset_id, dataset_path)
+        anns = sidecar.get(image_id)
+        if anns:
+            image_data["annotations"] = anns
+            image_data["has_annotations"] = True
     return image_data
 
 
@@ -1375,17 +1472,18 @@ async def update_annotations(dataset_id: str, image_id: str, update: AnnotationU
     """Update annotations for an image"""
     if dataset_id not in active_datasets:
         raise HTTPException(status_code=404, detail="Dataset not found")
-    
+
     dataset = active_datasets[dataset_id]
     dataset_path = DATASETS_DIR / dataset_id
-    
+
     annotation_manager.update_annotations(
         dataset_path,
         dataset["format"],
         image_id,
-        update.annotations
+        update.annotations,
+        dataset_id=dataset_id,
     )
-    
+
     # Invalidate image cache so next fetch reflects new annotations
     if dataset_id in _images_cache:
         # Update just the one image in cache rather than flushing entire cache
@@ -1396,11 +1494,24 @@ async def update_annotations(dataset_id: str, image_id: str, update: AnnotationU
                 img["has_annotations"] = len(update.annotations) > 0
                 break
 
-    # Update dataset stats
-    dataset_info = dataset_parser.parse_dataset(dataset_path, dataset["format"], dataset["name"])
-    dataset_info["id"] = dataset_id
-    active_datasets[dataset_id] = dataset_info
-    
+    # Do NOT re-parse the whole dataset here. parse_dataset() returns
+    # classes=[] for generic-images, which would wipe any classes the user
+    # added on the Classes page. Update the annotation count in place and
+    # persist via the manifest so restarts still see the latest stats.
+    if dataset["format"] == "generic-images":
+        sidecar = _load_generic_sidecar(dataset_id, dataset_path)
+        dataset["num_annotations"] = sum(len(v) for v in sidecar.values())
+    else:
+        try:
+            stats = dataset_parser.get_dataset_details(dataset_path, dataset["format"])
+            total = stats.get("total_annotations")
+            if total is not None:
+                dataset["num_annotations"] = total
+        except Exception:
+            pass
+    active_datasets[dataset_id] = dataset
+    _save_dataset_metadata(dataset_id, dataset)
+
     return {"success": True}
 
 
@@ -1573,6 +1684,22 @@ async def auto_annotate_single_image(
         text_prompt=text_prompt or None,
         image_path_hint=image_path_hint,
     )
+
+    # If text grounding was requested and native stage 1 errored out with
+    # no usable fallback, surface the real reason to the UI instead of
+    # returning an empty annotation list the user can't debug.
+    if text_prompt and not annotations:
+        err = getattr(model_manager, "_last_text_error", None)
+        if err:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"Text prompt not supported by this model: {err}. "
+                    "For SAM 3 / 3.1, text grounding requires the semantic "
+                    "predictor path; for SAM 2 / SAM 2.1, download yolov8s-"
+                    "worldv2.pt to enable the YOLO-World fallback."
+                ),
+            )
 
     return {"success": True, "annotations": annotations}
 
@@ -2253,29 +2380,144 @@ async def convert_dataset(request: ConversionRequest):
 
 @app.get("/api/export/{dataset_id}")
 async def export_dataset(dataset_id: str, target_format: str = None):
-    """Export a dataset as a downloadable zip file"""
+    """Export a dataset as a downloadable zip file.
+
+    generic-images datasets are a special case: the user's annotations live
+    in a JSON sidecar, not alongside the images, so zipping `dataset_path`
+    verbatim would hand back only the original images and lose all work.
+    We stage a fresh YOLO layout (images/ + labels/ + data.yaml) in TEMP_DIR
+    and zip that instead. If `target_format` is passed we then run the
+    normal converter on the staged YOLO tree.
+    """
     if dataset_id not in active_datasets:
         raise HTTPException(status_code=404, detail="Dataset not found")
-    
+
     dataset = active_datasets[dataset_id]
     dataset_path = DATASETS_DIR / dataset_id
-    
-    # Convert if needed
-    if target_format and target_format != dataset["format"]:
+
+    if dataset["format"] == "generic-images":
+        export_path = _stage_generic_as_yolo(dataset_id, dataset_path, dataset)
+        export_fmt = "yolo"
+        if target_format and target_format != "yolo":
+            converted = TEMP_DIR / f"{uuid.uuid4()}_{target_format}"
+            format_converter.convert(export_path, converted, "yolo", target_format)
+            export_path = converted
+            export_fmt = target_format
+    elif target_format and target_format != dataset["format"]:
         export_path = TEMP_DIR / str(uuid.uuid4())
         format_converter.convert(dataset_path, export_path, dataset["format"], target_format)
+        export_fmt = target_format
     else:
         export_path = dataset_path
-    
+        export_fmt = dataset["format"]
+
     # Create zip
-    zip_path = EXPORTS_DIR / f"{dataset['name']}_{target_format or dataset['format']}.zip"
+    zip_path = EXPORTS_DIR / f"{dataset['name']}_{export_fmt}.zip"
     shutil.make_archive(str(zip_path.with_suffix("")), "zip", export_path)
-    
+
     return FileResponse(
         zip_path,
         filename=zip_path.name,
         media_type="application/zip"
     )
+
+
+def _stage_generic_as_yolo(
+    dataset_id: str, dataset_path: Path, dataset: Dict[str, Any]
+) -> Path:
+    """Materialize a YOLO-format copy of a generic-images dataset.
+
+    - images/     copies (or symlinks) every source image, flattened to a
+                  single directory and renamed to match its stable id
+    - labels/     one <id>.txt per annotated image, using the same YOLO
+                  normalization as model_integration._save_annotations
+    - data.yaml   lists classes in dataset["classes"] order
+
+    Images whose id doesn't appear in the sidecar still get copied so the
+    zip is a complete dataset the user can re-load or train on.
+    """
+    import yaml as _yaml
+
+    staging = TEMP_DIR / f"export_{dataset_id}_{uuid.uuid4().hex[:8]}"
+    images_dir = staging / "images"
+    labels_dir = staging / "labels"
+    images_dir.mkdir(parents=True, exist_ok=True)
+    labels_dir.mkdir(parents=True, exist_ok=True)
+
+    sidecar = _load_generic_sidecar(dataset_id, dataset_path)
+    classes: List[str] = list(dataset.get("classes") or [])
+    class_to_id: Dict[str, int] = {name: idx for idx, name in enumerate(classes)}
+
+    # Walk the dataset root and mirror images into staging with the same
+    # id scheme the parser uses, so we can match annotations to files.
+    IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".tiff", ".tif"}
+    for src in Path(dataset_path).glob("**/*"):
+        if not src.is_file() or src.suffix.lower() not in IMAGE_EXTS:
+            continue
+        rel = src.relative_to(dataset_path)
+        stable_id = str(rel.with_suffix("")).replace("/", "__").replace("\\", "__")
+        dest = images_dir / f"{stable_id}{src.suffix.lower()}"
+        try:
+            shutil.copy2(src, dest)
+        except Exception as exc:
+            logger.warning("Could not stage image %s: %s", src, exc)
+            continue
+
+        anns = sidecar.get(stable_id) or []
+        if not anns:
+            continue
+
+        try:
+            from PIL import Image as _PILImage
+            with _PILImage.open(src) as img:
+                width, height = img.size
+        except Exception:
+            continue
+
+        lines: List[str] = []
+        for ann in anns:
+            cls_name = ann.get("class_name") or "object"
+            if cls_name not in class_to_id:
+                class_to_id[cls_name] = len(class_to_id)
+                classes.append(cls_name)
+            cls_id = class_to_id[cls_name]
+
+            if ann.get("type") == "polygon":
+                pts = ann.get("points") or []
+                normalized = ann.get("normalized")
+                flat: List[float] = []
+                for i in range(0, len(pts) - 1, 2):
+                    if normalized:
+                        flat.extend([float(pts[i]), float(pts[i + 1])])
+                    else:
+                        flat.extend([float(pts[i]) / width, float(pts[i + 1]) / height])
+                if flat:
+                    lines.append(
+                        f"{cls_id} " + " ".join(f"{p:.6f}" for p in flat)
+                    )
+            elif ann.get("bbox"):
+                bx, by, bw, bh = [float(v) for v in ann["bbox"][:4]]
+                xc = (bx + bw / 2) / width
+                yc = (by + bh / 2) / height
+                lines.append(
+                    f"{cls_id} {xc:.6f} {yc:.6f} {bw / width:.6f} {bh / height:.6f}"
+                )
+
+        if lines:
+            (labels_dir / f"{stable_id}.txt").write_text("\n".join(lines) + "\n")
+
+    # Write data.yaml with whatever class list we finished with (the loop
+    # above may have added classes the user never declared but which appear
+    # in annotation payloads).
+    data_yaml = {
+        "path": ".",
+        "train": "images",
+        "val": "images",
+        "names": {i: n for i, n in enumerate(classes)},
+        "nc": len(classes),
+    }
+    (staging / "data.yaml").write_text(_yaml.safe_dump(data_yaml, sort_keys=False))
+    return staging
 
 
 # ============== DATASET MERGING ==============

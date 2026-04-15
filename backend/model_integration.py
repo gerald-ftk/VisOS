@@ -29,6 +29,11 @@ class ModelManager:
         # given model id so callers can surface failure reasons even when the
         # failed entry is not kept in loaded_models.
         self.last_load_result: Dict[str, Dict[str, Any]] = {}
+        # Set by _run_inference when the SAM native text-grounding stage
+        # errored out and we had no on-disk YOLO-World fallback. Callers can
+        # read this to surface a real error to the user instead of silently
+        # returning an empty annotation list.
+        self._last_text_error: Optional[str] = None
     
     # Legacy Meta-format checkpoint stems — incompatible with ultralytics, hidden from UI
     _SAM_LEGACY_STEMS = {
@@ -1015,6 +1020,10 @@ class ModelManager:
         image_path_hint: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Auto-annotate a single image"""
+        # Reset the per-call text-error slot so a previous failure can't
+        # leak into this call's result.
+        self._last_text_error = None
+
         # Auto-load from disk if not already in memory
         if model_id not in self.loaded_models or not self.loaded_models[model_id].get("model"):
             self._try_autoload(model_id)
@@ -1132,13 +1141,13 @@ class ModelManager:
                 image_array = np.array(image)
                 h, w = image_array.shape[:2]
 
-                def _mask_xy_to_annotation(mask_xy, cls_name="object") -> Optional[Dict]:
+                def _mask_xy_to_annotation(mask_xy, cls_name="object", cls_id=0) -> Optional[Dict]:
                     pts = np.array(mask_xy, dtype=np.float32)
                     if len(pts) < 3:
                         return None
                     return {
                         "type": "polygon",
-                        "class_id": 0,
+                        "class_id": int(cls_id),
                         "class_name": cls_name,
                         "points": pts.flatten().tolist(),
                     }
@@ -1148,41 +1157,63 @@ class ModelManager:
 
                     if text_prompt is not None:
                         texts = [t.strip() for t in text_prompt.split(",") if t.strip()] or [text_prompt]
+                        stage1_error: Optional[str] = None
 
                         # ── Stage 1: try SAM native text grounding (low conf) ──
-                        # SAM2.1 + GroundingDINO works here; SAM3 might not have
-                        # a text encoder — we fall through to Stage 2 if empty.
-                        try:
-                            native_results = model(
-                                str(image_path), texts=texts,
-                                conf=0.1, verbose=False, device=device
-                            )
+                        # Ultralytics' public kwarg for text prompting has
+                        # drifted between releases: newer builds want
+                        # `prompts={"texts": [...]}`, older ones accept the
+                        # flat `texts=[...]` kwarg. Try both before declaring
+                        # that native text isn't supported by this model.
+                        native_results = None
+                        for attempt in ("kwarg", "prompts"):
+                            try:
+                                if attempt == "kwarg":
+                                    native_results = model(
+                                        str(image_path), texts=texts,
+                                        conf=0.1, verbose=False, device=device,
+                                    )
+                                else:
+                                    native_results = model(
+                                        str(image_path), prompts={"texts": texts},
+                                        conf=0.1, verbose=False, device=device,
+                                    )
+                                break
+                            except Exception as e:
+                                stage1_error = f"{type(e).__name__}: {e}"
+                                print(f"[sam_text] native attempt {attempt!r} failed: {stage1_error}")
+                                native_results = None
+                        if native_results is not None:
                             for result in native_results:
                                 if result.masks is None:
                                     continue
                                 result_boxes = result.boxes
                                 for i, mask_xy in enumerate(result.masks.xy):
                                     cls_name = texts[0] if len(texts) == 1 else "object"
+                                    cls_id_out = 0
                                     if result_boxes is not None and i < len(result_boxes):
                                         try:
-                                            cls_id = int(result_boxes[i].cls[0])
-                                            cls_name = texts[cls_id] if cls_id < len(texts) else texts[0]
+                                            raw_cls = int(result_boxes[i].cls[0])
+                                            if raw_cls < len(texts):
+                                                cls_name = texts[raw_cls]
+                                                cls_id_out = raw_cls
                                         except Exception:
                                             pass
-                                    ann = _mask_xy_to_annotation(mask_xy, cls_name)
+                                    ann = _mask_xy_to_annotation(mask_xy, cls_name, cls_id_out)
                                     if ann:
                                         annotations.append(ann)
-                        except Exception:
-                            pass  # Native text not supported by this model
 
                         # ── Stage 2: YOLO-World → boxes → SAM masks ────────────
-                        # Reliable two-stage pipeline: YOLO-World detects regions
-                        # matching the text labels; SAM turns those boxes into masks.
-                        if not annotations:
+                        # Only if yolov8s-worldv2.pt is already on disk. We
+                        # refuse to silently download a second ~100 MB model
+                        # on the user's first text prompt — if stage 1 failed
+                        # and YOLO-World isn't downloaded, we return empty and
+                        # let the caller surface stage1_error to the user.
+                        yolo_world_weights = self.models_dir / "yolov8s-worldv2.pt"
+                        if not annotations and yolo_world_weights.exists():
                             try:
                                 from ultralytics import YOLOWorld
-                                # Use the small variant (~100 MB); ultralytics caches it
-                                world = YOLOWorld("yolov8s-worldv2.pt")
+                                world = YOLOWorld(str(yolo_world_weights))
                                 self._apply_device_to_model(world)
                                 world.set_classes(texts)
                                 det = world(
@@ -1196,7 +1227,6 @@ class ModelManager:
                                         texts[cid] if cid < len(texts) else texts[0]
                                         for cid in cls_ids
                                     ]
-                                    # Use SAM to generate masks from detected boxes
                                     sam_results = model(
                                         str(image_path), bboxes=boxes_xyxy,
                                         verbose=False, device=device
@@ -1206,11 +1236,18 @@ class ModelManager:
                                             continue
                                         for i, mask_xy in enumerate(result.masks.xy):
                                             cls_name = box_names[i] if i < len(box_names) else texts[0]
-                                            ann = _mask_xy_to_annotation(mask_xy, cls_name)
+                                            raw_cls = cls_ids[i] if i < len(cls_ids) else 0
+                                            ann = _mask_xy_to_annotation(mask_xy, cls_name, raw_cls)
                                             if ann:
                                                 annotations.append(ann)
                             except Exception as yolo_world_err:
                                 print(f"[text_seg] YOLO-World stage failed: {yolo_world_err}")
+
+                        if not annotations and stage1_error:
+                            # Stash the native-stage error on the instance so
+                            # the endpoint can surface it to the user as a
+                            # helpful HTTP 422 instead of a silent empty list.
+                            self._last_text_error = stage1_error
 
                     elif prompt_point is not None:
                         # Point-prompted: clicked pixel coordinates (normalized → pixel)
