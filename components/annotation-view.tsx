@@ -770,6 +770,15 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
     }
     setSamPoints(pointsForRequest)
     setIsSamLoading(true)
+
+    // The backend tags every SAM mask "object" / class_id 0 — that's what
+    // the model produced, not what the user wants. Override with the
+    // active class (same as manual bboxes) so YOLO export maps correctly.
+    const resolvedClass = activeClass || localClasses[0] || 'object'
+    const resolvedClassId = Math.max(0, localClasses.indexOf(resolvedClass))
+    const tagAnnotations = (anns: Annotation[]): Annotation[] =>
+      anns.map(a => ({ ...a, class_name: resolvedClass, class_id: resolvedClassId }))
+
     try {
       const params = new URLSearchParams({
         model_id: selectedModel,
@@ -781,20 +790,31 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
         `${apiUrl}/api/auto-annotate/${selectedDataset.id}/single/${currentImage.id}?${params}`,
         { method: 'POST' }
       )
-      if (!resp.ok) throw new Error('SAM failed')
+      if (!resp.ok) {
+        // Surface the real backend message (e.g. gated HF token or text
+        // stage error) rather than a generic "SAM failed".
+        let detail = 'SAM failed'
+        try {
+          const errJson = await resp.json()
+          if (errJson?.detail) detail = errJson.detail
+        } catch {}
+        throw new Error(detail)
+      }
       const data = await resp.json()
       if (data.annotations?.length) {
         // Replace the previous SAM refinement (if any) with the new mask,
-        // keeping any unrelated annotations the user had before.
-        const next = [...masksBeforeThisClick, ...data.annotations]
+        // keeping any unrelated annotations the user had before. Tag the
+        // new masks with the user's active class so they're not all
+        // labelled "object".
+        const next = [...(masksBeforeThisClick || []), ...tagAnnotations(data.annotations)]
         setAnnotations(next)
         saveToHistory(next)
         await saveAnnotations(false, next)
       } else {
         toast.info('No mask for those points')
       }
-    } catch {
-      toast.error('SAM annotation failed')
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'SAM annotation failed')
     } finally {
       setIsSamLoading(false)
     }

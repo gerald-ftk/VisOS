@@ -1088,19 +1088,26 @@ class DatasetParser:
         return images
     
     def _get_generic_images(self, path: Path) -> List[Dict[str, Any]]:
-        """Get images from unknown format"""
+        """Get images from unknown format.
+
+        The id is built from the relative path with `/` → `__` so two images
+        with the same stem in different subdirectories don't collide, and so
+        the id is still safe to pass as a URL path segment to
+        /api/datasets/{id}/image/{image_id}.
+        """
         images = []
-        
         for img_file in path.glob("**/*"):
-            if img_file.suffix.lower() in self.IMAGE_EXTENSIONS:
-                images.append({
-                    "id": img_file.stem,
-                    "filename": img_file.name,
-                    "path": str(img_file.relative_to(path)),
-                    "annotations": [],
-                    "has_annotations": False
-                })
-        
+            if img_file.suffix.lower() not in self.IMAGE_EXTENSIONS:
+                continue
+            rel = img_file.relative_to(path)
+            stable_id = str(rel.with_suffix("")).replace("/", "__").replace("\\", "__")
+            images.append({
+                "id": stable_id,
+                "filename": img_file.name,
+                "path": str(rel),
+                "annotations": [],
+                "has_annotations": False,
+            })
         return images
     
     def get_image_data(self, path: Path, format_name: str, image_id: str) -> Dict[str, Any]:
