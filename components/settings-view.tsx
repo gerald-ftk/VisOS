@@ -369,7 +369,7 @@ export function SettingsView() {
                   className="w-full gap-2"
                   disabled={stopping}
                   onClick={async () => {
-                    if (!confirm("Stop the backend server? The app will stop working until you run  python run.py start  again.")) return
+                    if (!confirm("Stop the backend server? The app will stop working until you run  uv run app.py  again.")) return
                     setStopping(true)
                     try {
                       await fetch(`${settings.apiUrl}/api/shutdown`, { method: "POST" })
@@ -384,7 +384,7 @@ export function SettingsView() {
                   }
                 </Button>
                 <p className="text-xs text-muted-foreground mt-1">
-                  Fully stops the Python process. Restart with <code className="bg-muted px-1 py-0.5 rounded">python run.py restart-back</code>.
+                  Fully stops the Python process. Restart with <code className="bg-muted px-1 py-0.5 rounded">uv run app.py</code>.
                 </p>
               </div>
             </div>

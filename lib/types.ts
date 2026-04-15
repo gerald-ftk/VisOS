@@ -74,7 +74,7 @@ export interface Dataset {
 }
 
 // Model Types
-export type ModelType = "yolo" | "sam" | "rtdetr" | "detr" | "faster_rcnn" | "mask_rcnn" | "custom"
+export type ModelType = "sam3"
 
 export interface Model {
   id: string
@@ -87,44 +87,6 @@ export interface Model {
   loaded: boolean
   accuracy?: number
   addedAt: string
-}
-
-// Training Types
-export interface TrainingConfig {
-  datasetPath: string
-  modelArch: string
-  taskType: TaskType
-  epochs: number
-  batchSize: number
-  imgSize: number
-  learningRate: number
-  patience: number
-  useAugmentation: boolean
-  usePretrained: boolean
-  outputPath: string
-}
-
-export interface TrainingMetrics {
-  epoch: number
-  loss: number
-  accuracy: number
-  valLoss: number
-  valAccuracy: number
-  learningRate: number
-  mAP?: number
-  precision?: number
-  recall?: number
-}
-
-export interface TrainingJob {
-  id: string
-  config: TrainingConfig
-  status: "pending" | "running" | "paused" | "completed" | "failed"
-  progress: number
-  metrics: TrainingMetrics[]
-  startedAt?: string
-  completedAt?: string
-  error?: string
 }
 
 // Merge Types

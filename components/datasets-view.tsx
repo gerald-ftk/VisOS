@@ -342,7 +342,7 @@ export function DatasetsView({
           <p className="text-[10px] font-mono uppercase tracking-[0.2em] text-muted-foreground/50 mb-2">Datasets</p>
           <h2 className="text-2xl font-display font-bold tracking-tight">Your Datasets</h2>
           <p className="text-sm text-muted-foreground mt-1 max-w-lg">
-            A dataset is a collection of images paired with labels. Load one here to begin annotating, processing, or training.
+            A dataset is a collection of images paired with labels. Load one here to begin annotating and processing.
           </p>
         </div>
         <Button onClick={handleOpenFolderBrowser} variant="outline" className="shrink-0">

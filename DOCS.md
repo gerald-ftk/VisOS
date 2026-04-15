@@ -14,10 +14,9 @@
 10. [Format Conversion](#format-conversion)
 11. [Dataset Merging](#dataset-merging)
 12. [Model Management](#model-management)
-13. [Training](#training)
-14. [Batch Jobs](#batch-jobs)
-15. [Settings](#settings)
-16. [API Reference](#api-reference)
+13. [Batch Jobs](#batch-jobs)
+14. [Settings](#settings)
+15. [API Reference](#api-reference)
 
 ---
 
@@ -31,40 +30,32 @@
 - Storage: 10 GB free space
 - OS: Windows 10+, macOS 11+, Ubuntu 20.04+
 
-**Recommended (for training):**
+**Recommended (for SAM 3 inference):**
 - CPU: Intel i7 / AMD Ryzen 7 or better
 - RAM: 16 GB+
 - GPU: NVIDIA RTX 3060+ with 8 GB+ VRAM
-- Storage: SSD with 50 GB+ free space
+- Storage: SSD with 10 GB+ free space (SAM 3 weights are ~3.5 GB)
 
 ### First Launch
 
 1. Start the application:
    ```bash
-   python3 run.py start
+   uv run app.py
    ```
 
-2. The application opens at `http://localhost:3000`
+2. Open `http://localhost:3000` in your browser.
 
-3. **First step**: Go to **Settings** and verify the backend connection shows "Connected"
+3. **First step**: Go to **Settings** and verify the backend connection shows "Connected".
 
-4. **Load your first dataset**: Click **Datasets** → **Open Local Folder** → navigate to your dataset directory
+4. **Load your first dataset**: Click **Datasets** → **Open Local Folder** → navigate to your dataset directory.
 
-### Process Manager Commands
+### Process Manager
 
-```bash
-python3 run.py start           # Start both servers
-python3 run.py stop            # Stop cleanly
-python3 run.py restart         # Full restart
-python3 run.py restart-back    # Backend only
-python3 run.py restart-front   # Frontend only
-python3 run.py status          # Show PIDs and ports
-python3 run.py logs            # Tail live output from both servers
-```
+`app.py` starts both the FastAPI backend and the Next.js frontend. Ctrl-C stops them. There is no separate `restart` command — stop and re-run.
 
 ### Understanding the Interface
 
-- **Sidebar (left)**: Navigation grouped into Data, Annotate, Process, Train, and Analyze sections
+- **Sidebar (left)**: Navigation grouped into Data, Annotate, Process, and Analyze sections
 - **Main area (center)**: The active view
 - **Dataset indicator**: Shows the currently selected dataset
 
@@ -250,7 +241,7 @@ Run model inference across your entire dataset:
 3. Configure:
    - **Model**: select loaded model
    - **Confidence threshold**: minimum confidence (0.1–1.0)
-   - **Text prompt** (GroundingDINO only): comma-separated class names for zero-shot detection
+   - **Text prompt** (SAM 3): a noun phrase like "person" or "yellow school bus" — SAM 3 finds every matching instance in the image
 4. Click **Run**
 5. Review results in Sort & Filter
 
@@ -486,96 +477,28 @@ Mapping:
 
 ### Available Pretrained Models
 
-**YOLO family:**
-- YOLOv5 Nano, Small
-- YOLOv8 Nano / Small / Medium / Large / XLarge
-- YOLOv8 Seg variants (n/s/m) — instance segmentation
-- YOLOv8 Cls variants (n/s) — classification
-- YOLOv9 Nano / Small / Medium / Compact / Extended
-- YOLOv10 Nano / Small / Medium / Balanced / Large / XLarge
+Only SAM 3 and SAM 3.1 are supported. Both are gated on HuggingFace and require a personal access token.
 
-**Transformer-based detection:**
-- RT-DETR Large, XLarge
-- RF-DETR Base, Large
-
-**Segmentation (SAM):**
-- SAM ViT-B, ViT-L
-- SAM 2 Tiny / Small / Base+ / Large
-- SAM 2.1 Tiny / Small / Base+ / Large
-- SAM 3
-
-**Zero-shot detection:**
-- GroundingDINO Tiny
-- GroundingDINO Base
+- **SAM 3** (`facebook/sam3`) — text-prompted concept segmentation with point and box interactive support
+- **SAM 3.1** (`facebook/sam3.1`) — drop-in improvement over SAM 3 with the same API
 
 ### Downloading Models
 
 1. Go to **Models**
-2. Find the model in the available list
-3. Click **Download** — progress is shown inline
+2. Paste your HuggingFace access token into the input under SAM 3 / SAM 3.1 (get one at `hf.co/settings/tokens`)
+3. Click the download icon — progress is shown inline
 4. Once downloaded, click **Load** to make it available for inference
 
-### Importing Custom Models
+### Importing Custom Checkpoints
 
 1. Go to **Models**
 2. Click **Import Model**
-3. Select a `.pt`, `.pth`, or `.onnx` file
-4. Configure name and type
-5. Click **Import**
+3. Select a SAM 3 `.pt` checkpoint
+4. Click **Import**
 
 ### Loading and Unloading
 
 Click **Load** to move a model into GPU memory for inference. Click **Unload** to free that memory. Only loaded models are available for auto-annotation.
-
----
-
-## Training
-
-### Supported Architectures
-
-| Architecture | Task types |
-|---|---|
-| YOLOv8 (n/s/m/l/x) | Detection |
-| YOLOv8 Seg (n/s/m) | Instance segmentation |
-| YOLOv8 Cls (n/s) | Classification |
-| YOLOv9 (n/s/m/c/e) | Detection |
-| YOLOv10 (n/s/m/b/l/x) | Detection |
-| RF-DETR Base / Large | Detection |
-
-### How to Start Training
-
-1. Go to **Training**
-2. Select a dataset
-3. Choose an architecture
-4. Configure hyperparameters:
-   - **Epochs**: number of training passes
-   - **Batch size**: images per step
-   - **Image size**: input resolution
-   - **Learning rate**
-   - **Early-stopping patience**: stop if val loss doesn't improve for N epochs
-5. Click **Start Training**
-
-### Live Monitoring
-
-Training metrics update in real time:
-- Loss and validation loss curves
-- Accuracy curve
-- GPU memory usage
-- Current epoch and ETA
-
-### Controls
-
-- **Pause**: suspend training and save state
-- **Resume**: continue from pause
-- **Stop**: end training and save a checkpoint
-
-### Exporting Trained Weights
-
-After training completes:
-1. Go to **Models**
-2. Find the trained model
-3. Click **Export**
-4. Choose format: PyTorch (`.pt`), ONNX (`.onnx`), or TensorRT (`.engine`)
 
 ---
 
@@ -686,16 +609,6 @@ POST /datasets/{id}/auto-annotate        Run inference on a dataset
 GET  /api/auto-annotate/jobs             List all batch annotation jobs
 ```
 
-### Training
-
-```
-POST /training/start                     Start a training job
-GET  /training/{job_id}/status           Metrics and status
-POST /training/{job_id}/pause            Pause
-POST /training/{job_id}/resume           Resume
-POST /training/{job_id}/stop             Stop and save checkpoint
-```
-
 ### System
 
 ```
@@ -710,21 +623,20 @@ GET /api/health                          Backend health check
 Python failed to start. Check `.logs/backend.log`. Common causes: Python < 3.10, port 8000 already in use, missing OpenCV system dependency.
 
 **First startup hangs for a long time**  
-Normal. PyTorch and Ultralytics are large (~1.5 GB total). Watch `.logs/backend.log` for pip's progress.
+Normal. PyTorch, transformers, and the `sam3` package are large. Watch `.logs/backend.log` for uv's install progress.
 
 **"Dataset format not recognized"**  
 Auto-detection looks for specific files (`data.yaml`, `instances_train.json`, `Annotations/*.xml`, etc). Make sure your folder structure matches exactly. Nested ZIPs inside a ZIP are not supported — extract first.
 
-**Out of memory during training**  
-Reduce batch size (try 4–8), reduce image size (try 320), or switch to a smaller architecture (`yolov8n`). Check VRAM with `nvidia-smi`. Close other GPU applications.
+**SAM 3 download fails with 401/403**  
+Both `facebook/sam3` and `facebook/sam3.1` are gated. Request access on the model page, generate a HuggingFace token at `hf.co/settings/tokens`, and paste it into the Models view on first download.
 
 **Port 3000 or 8000 still in use after a crash**  
-Run `python3 run.py stop`. If that fails:  
 macOS/Linux: `lsof -ti:3000 | xargs kill -9` and `lsof -ti:8000 | xargs kill -9`  
 Windows: `netstat -ano | findstr :3000` → `taskkill /F /PID <pid>`
 
 **Blank frontend or 500 error**  
-Run `npm install` manually in the project root, then `python3 run.py restart-front`. Check `.logs/frontend.log` for the cause.
+Run `npm install` manually in the project root, then `uv run app.py`. Check `.logs/frontend.log` for the cause.
 
 **Model not loading**  
 Check that the file isn't corrupted and that you have sufficient GPU memory. Try unloading other models first.

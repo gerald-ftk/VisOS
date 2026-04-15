@@ -27,7 +27,6 @@ from dataset_parsers import DatasetParser
 from format_converter import FormatConverter
 from annotation_tools import AnnotationManager
 from model_integration import ModelManager
-from training import TrainingManager
 from dataset_merger import DatasetMerger
 from video_utils import VideoFrameExtractor, DuplicateDetector, CLIPEmbeddingManager
 from augmentation import DatasetAugmenter
@@ -55,7 +54,6 @@ dataset_parser = DatasetParser()
 format_converter = FormatConverter()
 annotation_manager = AnnotationManager()
 model_manager = ModelManager(MODELS_DIR)
-training_manager = TrainingManager()
 dataset_merger = DatasetMerger()
 video_extractor = VideoFrameExtractor()
 duplicate_detector = DuplicateDetector()
@@ -224,54 +222,17 @@ def _restore_datasets():
         print(f"[startup] Restored {restored} dataset(s) from workspace.")
 
 
-def _ensure_packages(packages: list[tuple[str, str]]) -> None:
-    """Auto-install missing Python packages. packages = [(import_name, pip_name), ...]"""
-    import importlib, subprocess, sys
-    missing = [pip for imp, pip in packages if importlib.util.find_spec(imp) is None]
-    if missing:
-        print(f"[startup] Auto-installing missing packages: {missing}")
-        subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--quiet"] + missing,
-            check=False,
-        )
-
-
-# Module-level GPU install status — polled by /api/device-info and the frontend banner
+# Module-level GPU status — polled by /api/device-info and the frontend banner
 _gpu_status: dict = {
-    "state": "unknown",   # "ready" | "installing" | "failed" | "no_gpu" | "unknown"
+    "state": "unknown",   # "ready" | "no_gpu" | "unknown"
     "message": "",
     "gpu_name": "",
 }
 
 
-def _ensure_cuda_torch() -> None:
-    """
-    If NVIDIA GPU hardware is present but the installed PyTorch lacks CUDA support,
-    automatically install the CUDA-enabled wheel and restart the backend process.
-    Runs in a background daemon thread so server startup is never blocked.
-    After a successful install, touches main.py (triggers WatchFiles reload) and
-    calls os._exit(0) to kill the worker — WatchFiles spawns a fresh worker that
-    picks up the new CUDA-enabled torch.
-    """
-    import subprocess, sys, os, pathlib, time
-
+def _probe_gpu() -> None:
+    """Detect whether the current torch install has CUDA available."""
     global _gpu_status
-
-    # 1. Detect GPU hardware via nvidia-smi (doesn't need torch)
-    try:
-        r = subprocess.run(
-            ["nvidia-smi", "-L"], capture_output=True, text=True, timeout=5
-        )
-        if r.returncode != 0 or "GPU" not in r.stdout:
-            _gpu_status["state"] = "no_gpu"
-            return
-        gpu_line = r.stdout.strip().splitlines()[0]
-        _gpu_status["gpu_name"] = gpu_line
-    except Exception:
-        _gpu_status["state"] = "no_gpu"
-        return  # nvidia-smi not found → no NVIDIA GPU
-
-    # 2. Check if current torch already has CUDA
     try:
         import torch
         if torch.cuda.is_available():
@@ -279,88 +240,21 @@ def _ensure_cuda_torch() -> None:
             msg = f"CUDA ready: {name} (torch {torch.__version__}, CUDA {torch.version.cuda})"
             print(f"[GPU] {msg}")
             _gpu_status.update({"state": "ready", "message": msg, "gpu_name": name})
-            return  # Already good
-        torch_ver = torch.__version__
-        print(f"[GPU] GPU found ({gpu_line}) but torch {torch_ver} has no CUDA support.")
-    except ImportError:
-        torch_ver = "not installed"
-        print(f"[GPU] GPU found ({gpu_line}) but torch is not installed yet.")
-
-    # 3. Auto-install CUDA-enabled PyTorch
-    # Detect the right CUDA wheel from the driver version
-    cuda_ver = "cu124"
-    try:
-        nv = subprocess.run(
-            ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
-            capture_output=True, text=True, timeout=5
-        )
-        drv = float(nv.stdout.strip().split(".")[0]) if nv.returncode == 0 else 0
-        cuda_ver = "cu124" if drv >= 545 else "cu121"
-    except Exception:
-        pass
-
-    wheel_url = f"https://download.pytorch.org/whl/{cuda_ver}"
-    _gpu_status.update({
-        "state": "installing",
-        "message": f"Installing CUDA PyTorch ({cuda_ver})… backend will restart when done. "
-                   f"Inference uses CPU until then.",
-        "gpu_name": gpu_line,
-    })
-    print(f"[GPU] Auto-installing CUDA PyTorch ({cuda_ver}) from {wheel_url} ...")
-
-    result = subprocess.run(
-        [
-            sys.executable, "-m", "pip", "install",
-            "torch", "torchvision", "torchaudio",
-            "--index-url", wheel_url,
-            "--upgrade", "--quiet",
-        ],
-        timeout=900,
-        check=False,
-    )
-
-    if result.returncode == 0:
-        print("[GPU] CUDA PyTorch installed. Triggering backend restart via WatchFiles...")
-        _gpu_status["message"] = "Install done — restarting backend now…"
-        try:
-            # Touch this file → WatchFiles detects change → kills & respawns worker
-            pathlib.Path(__file__).touch()
-        except Exception:
-            pass
-        time.sleep(3)   # Give WatchFiles a moment to react
-        os._exit(0)     # Kill worker process; WatchFiles spawns a fresh one with CUDA torch
-    else:
-        install_error = (result.stderr or result.stdout or "unknown error")[-400:]
-        print(f"[GPU] CUDA PyTorch install failed: {install_error}")
+            return
         _gpu_status.update({
-            "state": "failed",
-            "message": f"Auto-install failed. Run manually:\n"
-                       f"pip install torch torchvision --index-url {wheel_url}\n"
-                       f"then restart the backend.",
+            "state": "no_gpu",
+            "message": f"CUDA not available (torch {torch.__version__}). Inference runs on CPU.",
+        })
+    except ImportError:
+        _gpu_status.update({
+            "state": "no_gpu",
+            "message": "torch is not installed — SAM 3 inference unavailable.",
         })
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Both checks run in background threads so startup never blocks.
-    # _ensure_cuda_torch will call os.execv to restart the whole process once
-    # the CUDA wheel finishes installing — that's fine from a daemon thread.
-    threading.Thread(target=_ensure_cuda_torch, daemon=True).start()
-    threading.Thread(
-        target=_ensure_packages,
-        args=([
-            ("huggingface_hub", "huggingface_hub"),
-            ("ultralytics",     "ultralytics"),
-            ("cv2",             "opencv-python"),
-            ("PIL",             "Pillow"),
-            ("psutil",          "psutil"),
-            # Pre-install CLIP so ultralytics doesn't auto-install it mid-inference
-            # (which writes to venv and triggers a spurious WatchFiles reload)
-            ("clip",            "git+https://github.com/ultralytics/CLIP.git"),
-            ("ftfy",            "ftfy"),
-        ],),
-        daemon=True,
-    ).start()
+    _probe_gpu()
     _restore_datasets()
     _restore_jobs()
     yield
@@ -425,35 +319,6 @@ class MergeRequest(BaseModel):
     output_name: str
     output_format: str
     class_mapping: Optional[Dict[str, str]] = None
-
-
-class TrainingConfig(BaseModel):
-    dataset_id: str
-    model_type: str  # "yolo" | "segmentation" | "classification" | "rfdetr" | "rtdetr"
-    model_arch: str = "yolov8n"   # e.g. yolov8n, yolo11n, yolov9c, rtdetr-l, rfdetr_base
-    epochs: int = 100
-    batch_size: int = 16
-    image_size: int = 640
-    pretrained: bool = True
-    device: str = "auto"
-    # Advanced hyperparams (YOLO)
-    lr0: float = 0.01
-    lrf: float = 0.01
-    optimizer: str = "SGD"
-    patience: int = 50
-    cos_lr: bool = False
-    warmup_epochs: float = 3.0
-    weight_decay: float = 0.0005
-    mosaic: float = 1.0
-    hsv_h: float = 0.015
-    hsv_s: float = 0.7
-    hsv_v: float = 0.4
-    flipud: float = 0.0
-    fliplr: float = 0.5
-    amp: bool = True
-    dropout: float = 0.0
-
-
 
 
 class SettingsConfig(BaseModel):
@@ -1549,11 +1414,11 @@ async def list_models():
 @app.post("/api/models/load")
 async def load_model(
     model_file: UploadFile = File(None),
-    model_type: str = "yolo",
+    model_type: str = "sam3",
     model_name: str = None,
     pretrained: str = None
 ):
-    """Load a model for auto-annotation"""
+    """Load a SAM 3 / SAM 3.1 model for auto-annotation"""
     try:
         if model_file:
             # Save uploaded model
@@ -1710,20 +1575,14 @@ async def auto_annotate_single_image(
         image_path_hint=image_path_hint,
     )
 
-    # If text grounding was requested and native stage 1 errored out with
-    # no usable fallback, surface the real reason to the UI instead of
-    # returning an empty annotation list the user can't debug.
+    # If text grounding was requested and SAM 3 errored out, surface the real
+    # reason to the UI instead of returning an empty list the user can't debug.
     if text_prompt and not annotations:
         err = getattr(model_manager, "_last_text_error", None)
         if err:
             raise HTTPException(
                 status_code=422,
-                detail=(
-                    f"Text prompt not supported by this model: {err}. "
-                    "For SAM 3 / 3.1, text grounding requires the semantic "
-                    "predictor path; for SAM 2 / SAM 2.1, download yolov8s-"
-                    "worldv2.pt to enable the YOLO-World fallback."
-                ),
+                detail=f"SAM 3 text prompt failed: {err}",
             )
 
     return {"success": True, "annotations": annotations}
@@ -2581,239 +2440,6 @@ async def merge_datasets(request: MergeRequest):
     active_datasets[new_dataset_id] = new_info
     
     return {"success": True, "merged_dataset": new_info}
-
-
-# ============== TRAINING ==============
-
-def _resolve_base_model(model_arch: str, model_type: str) -> str:
-    """Return the correct model identifier for the chosen arch + task type."""
-    arch = model_arch.strip()
-    # RF-DETR arches are passed through as-is (no .pt extension)
-    if model_type == "rfdetr":
-        return arch  # e.g. "rfdetr_base" or "rfdetr_large"
-    # RT-DETR (ultralytics) — strip .pt and reattach
-    if model_type == "rtdetr":
-        base = arch.replace(".pt", "")
-        return f"{base}.pt"  # e.g. "rtdetr-l.pt"
-    # Strip any existing suffix variants so we can reattach cleanly
-    base = arch.replace("-seg", "").replace("-cls", "").replace(".pt", "")
-    if model_type == "segmentation":
-        filename = f"{base}-seg.pt"
-    elif model_type == "classification":
-        filename = f"{base}-cls.pt"
-    else:
-        filename = f"{base}.pt"
-    return filename
-
-
-@app.post("/api/install-cuda-torch")
-async def install_cuda_torch():
-    """Install CUDA-enabled PyTorch (requires restart after install)."""
-    import sys, subprocess
-    try:
-        result = subprocess.run(
-            [
-                sys.executable, "-m", "pip", "install",
-                "torch", "torchvision",
-                "--index-url", "https://download.pytorch.org/whl/cu121",
-                "--upgrade",
-            ],
-            capture_output=True, text=True, timeout=300
-        )
-        if result.returncode == 0:
-            return {"success": True, "message": "CUDA PyTorch installed. Restart the backend server to use GPU."}
-        else:
-            return {"success": False, "message": result.stderr[-2000:] or result.stdout[-2000:]}
-    except subprocess.TimeoutExpired:
-        return {"success": False, "message": "Install timed out after 5 minutes."}
-    except Exception as e:
-        return {"success": False, "message": str(e)}
-
-
-@app.post("/api/train")
-async def start_training(config: TrainingConfig, background_tasks: BackgroundTasks):
-    """Start training a model on a dataset"""
-    if config.dataset_id not in active_datasets:
-        raise HTTPException(status_code=404, detail="Dataset not found")
-
-    dataset = active_datasets[config.dataset_id]
-    dataset_path = DATASETS_DIR / config.dataset_id
-
-    # ── Dataset / model-type compatibility check ─────────────────────────────
-    ds_format    = (dataset.get("format") or "").lower()
-    ds_task_type = (dataset.get("task_type") or "detection").lower()
-    mt = config.model_type  # "yolo" | "segmentation" | "classification" | "rtdetr" | "rfdetr"
-
-    CLASSIFICATION_FORMATS = {"classification-folder", "classification_folder"}
-    SEGMENTATION_FORMATS   = {"cityscapes", "ade20k", "yolo-seg"}
-
-    is_cls_dataset = (
-        ds_format in CLASSIFICATION_FORMATS or ds_task_type == "classification"
-    )
-    is_seg_dataset = (
-        ds_format in SEGMENTATION_FORMATS or ds_task_type == "segmentation"
-    )
-    is_det_dataset = not is_cls_dataset and not is_seg_dataset
-
-    detection_model = mt in ("yolo", "rtdetr", "rfdetr")
-    seg_model       = mt == "segmentation"
-    cls_model       = mt == "classification"
-
-    if is_cls_dataset and not cls_model:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                "This dataset is a classification dataset. "
-                "Please select a Classification model type."
-            ),
-        )
-    if is_seg_dataset and cls_model:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                "Segmentation datasets cannot be used to train a classification model. "
-                "Please select an Object Detection or Segmentation model type."
-            ),
-        )
-    if is_det_dataset and seg_model:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                "This dataset does not contain polygon segmentation masks. "
-                "Please select an Object Detection model type, or convert your dataset "
-                "to a segmentation format first."
-            ),
-        )
-    if is_det_dataset and cls_model:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                "Detection datasets cannot be used for classification training. "
-                "Please use a dataset in classification-folder format."
-            ),
-        )
-    # Note: detection model on seg dataset is ALLOWED (auto-converts polygons → bboxes)
-    # ─────────────────────────────────────────────────────────────────────────
-    
-    # Start training in background
-    training_id = training_manager.start_training(
-        dataset_path,
-        dataset["format"],
-        config.model_type,
-        {
-            "epochs": config.epochs,
-            "batch_size": config.batch_size,
-            "image_size": config.image_size,
-            "pretrained": config.pretrained,
-            "device": config.device,
-            "base_model": _resolve_base_model(config.model_arch, config.model_type),
-            # Advanced hyperparams forwarded for all model types
-            "lr0": config.lr0,
-            "lrf": config.lrf,
-            "optimizer": config.optimizer,
-            "patience": config.patience,
-            "cos_lr": config.cos_lr,
-            "warmup_epochs": config.warmup_epochs,
-            "weight_decay": config.weight_decay,
-            "mosaic": config.mosaic,
-            "hsv_h": config.hsv_h,
-            "hsv_s": config.hsv_s,
-            "hsv_v": config.hsv_v,
-            "flipud": config.flipud,
-            "fliplr": config.fliplr,
-            "amp": config.amp,
-            "dropout": config.dropout,
-        }
-    )
-    
-    return {"success": True, "training_id": training_id}
-
-
-@app.get("/api/train/{training_id}/status")
-async def get_training_status(training_id: str):
-    """Get training status and metrics"""
-    status = training_manager.get_status(training_id)
-    if not status:
-        raise HTTPException(status_code=404, detail="Training not found")
-    return status
-
-
-@app.post("/api/train/{training_id}/stop")
-async def stop_training(training_id: str):
-    """Stop an ongoing training"""
-    success = training_manager.stop_training(training_id)
-    return {"success": success}
-
-
-@app.post("/api/train/{training_id}/pause")
-async def pause_training(training_id: str):
-    """Pause training after the current epoch and save a checkpoint."""
-    success = training_manager.pause_training(training_id)
-    if not success:
-        raise HTTPException(status_code=400, detail="Training not running or not found")
-    return {"success": True, "message": "Pause requested — will stop after current epoch."}
-
-
-@app.post("/api/train/{training_id}/resume")
-async def resume_training(training_id: str):
-    """Resume a paused training run from the last checkpoint."""
-    result = training_manager.resume_training(training_id)
-    if not result:
-        raise HTTPException(status_code=400, detail="Cannot resume — not paused or no checkpoint found")
-    return {"success": True, "training_id": result}
-
-
-@app.post("/api/train/{training_id}/export-format")
-async def export_model_format(training_id: str, format: str = "onnx"):
-    """Export a trained model to a specific format (onnx, tflite, coreml, engine)."""
-    export_path = training_manager.export_model_format(training_id, format)
-    if not export_path:
-        raise HTTPException(status_code=404, detail="Model not found or export failed")
-    if not os.path.exists(export_path):
-        raise HTTPException(status_code=500, detail="Export produced no output file")
-    ext = os.path.splitext(export_path)[1] or f".{format}"
-    return FileResponse(export_path, filename=f"model{ext}")
-
-
-@app.get("/api/train/{training_id}/export")
-async def export_trained_model(training_id: str):
-    """Export a trained model"""
-    model_path = training_manager.get_model_path(training_id)
-    if not model_path or not os.path.exists(model_path):
-        raise HTTPException(status_code=404, detail="Model not found")
-
-    return FileResponse(model_path, filename=os.path.basename(model_path))
-
-
-@app.get("/api/train/{training_id}/report")
-async def download_training_report(training_id: str):
-    """Download a training report (JSON with epoch history and final metrics)."""
-    import json as _json
-    status = training_manager.get_status(training_id)
-    if not status:
-        raise HTTPException(status_code=404, detail="Training not found")
-
-    job = training_manager.training_jobs.get(training_id, {})
-    report = {
-        "training_id":   training_id,
-        "status":        status["status"],
-        "model_type":    job.get("model_type", ""),
-        "config":        {k: v for k, v in job.get("config", {}).items()
-                         if k not in ("device",)},
-        "started_at":    status["started_at"],
-        "device_info":   status["device_info"],
-        "total_epochs":  status["total_epochs"],
-        "current_epoch": status["current_epoch"],
-        "model_path":    status["model_path"],
-        "final_metrics": status["metrics"],
-        "epoch_history": status["epoch_history"],
-    }
-    content = _json.dumps(report, indent=2)
-    return Response(
-        content=content,
-        media_type="application/json",
-        headers={"Content-Disposition": f'attachment; filename="training_report_{training_id}.json"'},
-    )
 
 
 # ============== STATIC FILES ==============

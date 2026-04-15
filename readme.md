@@ -2,7 +2,7 @@
 
 # VisOS
 
-The all-in-one local workbench for computer vision datasets. Annotate, convert, augment, merge, and train — without touching a cloud service or writing a line of code.
+VisOS is a locally-run image annotation tool. No accounts, no uploads, no cloud service. Built around SAM 3 / SAM 3.1 for AI-assisted segmentation.
 
 ---
 
@@ -10,27 +10,19 @@ The all-in-one local workbench for computer vision datasets. Annotate, convert, 
 
 ---
 
-## Why
-
-Managing CV datasets is a grind. You download a COCO dataset, realise your framework expects YOLO, spend an hour writing a conversion script, discover half your classes are duplicates with different names, and write another script to fix it. Repeat forever.
-
-VisOS wraps all of that in a local UI. No accounts, no uploads, no bill.
-
----
-
 ## Getting Started
 
-**Prerequisites:** Python 3.10+, Node.js 18+, npm or pnpm
+**Prerequisites:** Python 3.10+, Node.js 18+, [uv](https://docs.astral.sh/uv/)
 
 ```bash
 git clone https://github.com/Dan04ggg/VisOS.git
 cd VisOS
-python3 run.py restart
+uv run app.py
 ```
 
-`run.py` creates a virtualenv, installs all dependencies, starts the FastAPI backend on `:8000` and the Next.js frontend on `:3000`, health-checks both, and opens your browser.
+`app.py` creates the uv-managed environment from `pyproject.toml`, installs backend dependencies (including `sam3` from GitHub), starts the FastAPI backend on `:8000` and the Next.js frontend on `:3000`, and prints the local URL. It does not open a browser — navigate to `http://localhost:3000` yourself.
 
-First run takes 2–5 minutes while PyTorch and Ultralytics download (~1.5 GB).
+First run takes several minutes while PyTorch, transformers, and the `sam3` package download.
 
 ---
 
@@ -78,7 +70,7 @@ Canvas-based editor with six tools:
 
 Full undo/redo. Annotations save automatically.
 
-**Auto-annotation:** load any YOLO, RT-DETR, RF-DETR, SAM, SAM 2/2.1/3, or GroundingDINO model and run inference directly on your dataset with a configurable confidence threshold. GroundingDINO supports zero-shot annotation via text prompt.
+**Auto-annotation:** load SAM 3 or SAM 3.1 and run point-prompt or text-prompt segmentation directly on your dataset. SAM 3 supports native text grounding — type a class name and it finds matching objects. Batch text-prompt jobs can be paused, resumed, and cancelled from the sidebar.
 
 ---
 
@@ -100,7 +92,7 @@ Convert any supported format to any other. Optionally copy images alongside anno
 
 ### Train / Val / Test Split
 
-Dedicated split view with configurable ratios, optional stratification by class, and a fixed random seed for reproducibility.
+Split a dataset into train/val/test subsets with configurable ratios, optional stratification by class, and a fixed random seed for reproducibility. Useful when exporting a dataset for use in an external training pipeline.
 
 ---
 
@@ -152,26 +144,9 @@ Combine multiple datasets with a class-mapping UI to resolve naming conflicts be
 
 ### Model Management
 
-Download pretrained weights from inside the app or import your own `.pt`, `.pth`, or `.onnx` file. Load and unload models to manage GPU memory.
-
-**Available pretrained models:**  
-YOLOv5 (n/s) · YOLOv8 (n/s/m/l/x, seg, cls variants) · YOLOv9 (n/s/m/c/e) · YOLOv10 (n/s/m/b/l/x) · RT-DETR (L/X) · RF-DETR (Base/Large) · SAM ViT-B/L · SAM 2 (Tiny/Small/Base+/Large) · SAM 2.1 (Tiny/Small/Base+/Large) · SAM 3 · GroundingDINO (Tiny/Base, zero-shot)
+Download SAM 3 or SAM 3.1 weights from HuggingFace directly in the app. Both are gated repos — paste your HuggingFace access token on first use (stored in `localStorage`). Load and unload models to manage GPU memory.
 
 ![Model management view with download and import options, loaded model shown with GPU memory usage](assets/images/model_management.png)
-
----
-
-### Training
-
-Train locally with live metric monitoring. Supports detection, instance segmentation, and classification tasks.
-
-**Architectures:** YOLOv8 · YOLOv9 · YOLOv10 · RF-DETR  
-**Configurable:** epochs, batch size, image size, learning rate, early-stopping patience  
-**Live:** loss, accuracy, validation loss, GPU usage, ETA  
-**Controls:** pause, resume, stop with checkpoint saving  
-**Export:** PyTorch, ONNX, TensorRT
-
-![Training view mid-run with loss and accuracy charts updating live and GPU usage visible](assets/images/training_view.png)
 
 ---
 
@@ -186,7 +161,7 @@ Track and manage background auto-annotation jobs. Resume interrupted jobs, previ
 **Gallery** — grid browser with annotation overlays and full-size click-through  
 **Compare** — side-by-side stats between two datasets  
 **Snapshots** — save and restore named dataset states before destructive operations  
-**YAML Config** — GUI editor for `data.yaml` files  
+**YAML Config** — GUI editor for `data.yaml` dataset descriptors  
 **Health Check** — backend API status, Python dependencies, GPU availability, workspace disk usage
 
 ---
@@ -194,13 +169,8 @@ Track and manage background auto-annotation jobs. Resume interrupted jobs, previ
 ## Usage
 
 ```bash
-python3 run.py start           # Start both servers
-python3 run.py stop            # Stop cleanly
-python3 run.py restart         # Full restart
-python3 run.py restart-back    # Backend only
-python3 run.py restart-front   # Frontend only
-python3 run.py status          # Show PIDs and ports
-python3 run.py logs            # Tail live output
+uv run app.py        # Start both servers
+# Ctrl-C to stop.
 ```
 
 No required environment variables for local use. Backend URL defaults to `http://localhost:8000` and is configurable in Settings.
@@ -210,8 +180,9 @@ No required environment variables for local use. Backend URL defaults to `http:/
 ## Architecture
 
 ```
-cv-dataset-manager/
-├── run.py                    # Cross-platform process manager
+VisOS/
+├── app.py                    # uv-based launcher (backend + frontend)
+├── pyproject.toml            # uv dependency manifest
 ├── backend/
 │   ├── main.py               # FastAPI entrypoint and all routes
 │   ├── dataset_parsers.py    # Format auto-detection and parsing
@@ -219,10 +190,8 @@ cv-dataset-manager/
 │   ├── annotation_tools.py   # Annotation read/write logic
 │   ├── augmentation.py       # Augmentation pipeline engine
 │   ├── dataset_merger.py     # Merge with class mapping
-│   ├── model_integration.py  # Model download, load/unload, inference
-│   ├── training.py           # Training job management and metric streaming
-│   ├── video_utils.py        # Frame extraction, duplicate detection, CLIP
-│   └── requirements.txt
+│   ├── model_integration.py  # SAM 3 download, load/unload, inference
+│   └── video_utils.py        # Frame extraction, duplicate detection, CLIP
 └── components/               # React views (one per sidebar section)
 ```
 
@@ -230,7 +199,7 @@ cv-dataset-manager/
 
 **Persistence:** Datasets survive restarts via `dataset_metadata.json` sidecars. On startup the backend scans `workspace/datasets/` and re-registers everything it finds.
 
-**Process manager:** `run.py` handles cross-platform PID tracking, port cleanup, and log streaming — no Docker required.
+**Launcher:** `app.py` uses uv to provision the backend environment and spawns both the FastAPI backend and the Next.js dev server. No Docker required.
 
 ---
 
@@ -248,26 +217,25 @@ Interactive docs: `http://localhost:8000/docs`
 | Augmentation | `POST /datasets/{id}/augment-enhanced` |
 | Video | `POST /video/extract` |
 | Duplicates | `POST /datasets/{id}/find-duplicates` · `/remove-duplicates` |
-| Models | `GET /models` · `POST /models/download` · `POST /models/import` · `POST /models/{id}/load` · `POST /models/{id}/unload` |
-| Auto-annotation | `POST /datasets/{id}/auto-annotate` · `GET /api/auto-annotate/jobs` |
-| Training | `POST /training/start` · `GET /training/{job_id}/status` · `/pause` · `/resume` · `/stop` |
+| Models | `GET /models` · `POST /models/download` · `POST /models/{id}/load` · `POST /models/{id}/unload` |
+| Auto-annotation | `POST /datasets/{id}/auto-annotate` · `POST /auto-annotate/{id}/text-batch` · `GET /api/auto-annotate/jobs` |
 | System | `GET /api/health` |
 
 ---
 
 ## Troubleshooting
 
-**"Backend not connected"** — Python failed to start. Check `.logs/backend.log`. Common causes: Python < 3.10, port 8000 in use, missing OpenCV system dependency.
+**"Backend not connected"** — Python failed to start. Check `.logs/backend.log`. Common causes: Python < 3.10, port 8000 in use, missing OpenCV system dependency, uv environment not provisioned.
 
-**First startup hangs** — Normal. PyTorch is large. Check `.logs/backend.log` to watch pip progress.
+**First startup hangs** — Normal. PyTorch, transformers, and the `sam3` package are large. Check `.logs/backend.log` to watch uv install progress.
 
 **"Dataset format not recognized"** — Auto-detection looks for specific files (`data.yaml`, `instances_train.json`, `Annotations/*.xml`, etc). Match the folder structure exactly. Nested ZIPs aren't supported — extract first.
 
-**OOM during training** — Lower batch size (try 4–8), lower image size (try 320), or use a smaller arch (`yolov8n`). Check VRAM with `nvidia-smi`.
+**SAM 3 download fails with 401/403** — Both `facebook/sam3` and `facebook/sam3.1` are gated on HuggingFace. Request access on the model page, generate a token at `hf.co/settings/tokens`, and paste it into the Models view on first download.
 
-**Port still in use after crash** — `python3 run.py stop`. If that fails: `lsof -ti:3000 | xargs kill -9` (macOS/Linux) or `netstat -ano | findstr :3000` → `taskkill /F /PID <pid>` (Windows).
+**Port still in use after crash** — Kill the process listening on the port. `lsof -ti:3000 | xargs kill -9` (macOS/Linux) or `netstat -ano | findstr :3000` → `taskkill /F /PID <pid>` (Windows).
 
-**Blank frontend / 500** — Run `npm install` manually in the project root, then `python3 run.py restart-front`.
+**Blank frontend / 500** — Run `npm install` manually in the project root, then `uv run app.py`.
 
 ---
 

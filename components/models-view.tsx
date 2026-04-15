@@ -36,7 +36,7 @@ import {
 interface BackendModel {
   id: string
   name: string
-  type: string        // "yolo" | "sam" | "sam2" | "detr" | "unknown"
+  type: string        // "sam3"
   loaded: boolean
   pretrained?: boolean
   downloaded?: boolean
@@ -48,7 +48,7 @@ interface ModelsViewProps {
   apiUrl?: string
 }
 
-// Pretrained models available from the backend – mirrors model_integration.py
+// SAM 3 / 3.1 — the only models the backend supports. Both are gated on HF.
 const PRETRAINED_CATALOG: Array<{
   id: string
   name: string
@@ -57,68 +57,8 @@ const PRETRAINED_CATALOG: Array<{
   sizeLabel: string
   requiresHfToken?: boolean
 }> = [
-  // ── YOLOv8 ──────────────────────────────────────────────────────────────────
-  { id: "yolov8n",     name: "YOLOv8 Nano",      type: "yolo",  task: "detection",          sizeLabel: "6 MB"    },
-  { id: "yolov8s",     name: "YOLOv8 Small",      type: "yolo",  task: "detection",          sizeLabel: "22 MB"   },
-  { id: "yolov8m",     name: "YOLOv8 Medium",     type: "yolo",  task: "detection",          sizeLabel: "52 MB"   },
-  { id: "yolov8l",     name: "YOLOv8 Large",      type: "yolo",  task: "detection",          sizeLabel: "87 MB"   },
-  { id: "yolov8x",     name: "YOLOv8 XLarge",     type: "yolo",  task: "detection",          sizeLabel: "136 MB"  },
-  // ── YOLOv5 ──────────────────────────────────────────────────────────────────
-  { id: "yolov5n",     name: "YOLOv5 Nano",       type: "yolo",  task: "detection",          sizeLabel: "4 MB"    },
-  { id: "yolov5s",     name: "YOLOv5 Small",       type: "yolo",  task: "detection",          sizeLabel: "14 MB"   },
-  // ── YOLOv9 ──────────────────────────────────────────────────────────────────
-  { id: "yolov9n",     name: "YOLOv9 Nano",       type: "yolo",  task: "detection",          sizeLabel: "4 MB"    },
-  { id: "yolov9s",     name: "YOLOv9 Small",      type: "yolo",  task: "detection",          sizeLabel: "14 MB"   },
-  { id: "yolov9m",     name: "YOLOv9 Medium",     type: "yolo",  task: "detection",          sizeLabel: "40 MB"   },
-  { id: "yolov9c",     name: "YOLOv9 Compact",    type: "yolo",  task: "detection",          sizeLabel: "51 MB"   },
-  { id: "yolov9e",     name: "YOLOv9 Extended",   type: "yolo",  task: "detection",          sizeLabel: "116 MB"  },
-  // ── YOLOv10 ─────────────────────────────────────────────────────────────────
-  { id: "yolov10n",    name: "YOLOv10 Nano",      type: "yolo",  task: "detection",          sizeLabel: "5 MB"    },
-  { id: "yolov10s",    name: "YOLOv10 Small",     type: "yolo",  task: "detection",          sizeLabel: "15 MB"   },
-  { id: "yolov10m",    name: "YOLOv10 Medium",    type: "yolo",  task: "detection",          sizeLabel: "32 MB"   },
-  { id: "yolov10b",    name: "YOLOv10 Balanced",  type: "yolo",  task: "detection",          sizeLabel: "40 MB"   },
-  { id: "yolov10l",    name: "YOLOv10 Large",     type: "yolo",  task: "detection",          sizeLabel: "50 MB"   },
-  { id: "yolov10x",    name: "YOLOv10 XLarge",    type: "yolo",  task: "detection",          sizeLabel: "61 MB"   },
-  // ── YOLO11 ──────────────────────────────────────────────────────────────────
-  { id: "yolo11n",     name: "YOLO11 Nano",       type: "yolo",  task: "detection",          sizeLabel: "5 MB"    },
-  { id: "yolo11s",     name: "YOLO11 Small",      type: "yolo",  task: "detection",          sizeLabel: "19 MB"   },
-  { id: "yolo11m",     name: "YOLO11 Medium",     type: "yolo",  task: "detection",          sizeLabel: "40 MB"   },
-  { id: "yolo11l",     name: "YOLO11 Large",      type: "yolo",  task: "detection",          sizeLabel: "51 MB"   },
-  { id: "yolo11x",     name: "YOLO11 XLarge",     type: "yolo",  task: "detection",          sizeLabel: "114 MB"  },
-  // ── YOLO12 ──────────────────────────────────────────────────────────────────
-  { id: "yolo12n",     name: "YOLO12 Nano",       type: "yolo",  task: "detection",          sizeLabel: "5 MB"    },
-  { id: "yolo12s",     name: "YOLO12 Small",      type: "yolo",  task: "detection",          sizeLabel: "19 MB"   },
-  { id: "yolo12m",     name: "YOLO12 Medium",     type: "yolo",  task: "detection",          sizeLabel: "40 MB"   },
-  { id: "yolo12l",     name: "YOLO12 Large",      type: "yolo",  task: "detection",          sizeLabel: "51 MB"   },
-  { id: "yolo12x",     name: "YOLO12 XLarge",     type: "yolo",  task: "detection",          sizeLabel: "114 MB"  },
-  // ── RT-DETR (Ultralytics) ────────────────────────────────────────────────────
-  { id: "rtdetr-l",    name: "RT-DETR Large",     type: "rtdetr", task: "detection",         sizeLabel: "~65 MB"  },
-  { id: "rtdetr-x",    name: "RT-DETR XLarge",    type: "rtdetr", task: "detection",         sizeLabel: "~135 MB" },
-  // ── RF-DETR (Roboflow) ───────────────────────────────────────────────────────
-  { id: "rfdetr_base",  name: "RF-DETR Base",     type: "rfdetr", task: "detection",         sizeLabel: "~160 MB" },
-  { id: "rfdetr_large", name: "RF-DETR Large",    type: "rfdetr", task: "detection",         sizeLabel: "~500 MB" },
-  // ── Zero-shot / Open-vocabulary ──────────────────────────────────────────────
-  { id: "yoloworld_s",  name: "YOLO-World S",     type: "yoloworld",    task: "zero-shot detection", sizeLabel: "~28 MB"  },
-  { id: "yoloworld_m",  name: "YOLO-World M",     type: "yoloworld",    task: "zero-shot detection", sizeLabel: "~86 MB"  },
-  { id: "yoloworld_l",  name: "YOLO-World L",     type: "yoloworld",    task: "zero-shot detection", sizeLabel: "~141 MB" },
-  { id: "groundingdino_t", name: "GroundingDINO Tiny", type: "groundingdino", task: "zero-shot detection", sizeLabel: "~694 MB" },
-  { id: "groundingdino_b", name: "GroundingDINO Base", type: "groundingdino", task: "zero-shot detection", sizeLabel: "~914 MB" },
-  // ── SAM 1 ────────────────────────────────────────────────────────────────────
-  { id: "sam_vit_b",   name: "SAM ViT-B",         type: "sam",   task: "segmentation",       sizeLabel: "375 MB"  },
-  { id: "sam_vit_l",   name: "SAM ViT-L",         type: "sam",   task: "segmentation",       sizeLabel: "1.2 GB"  },
-  // ── SAM 2 ────────────────────────────────────────────────────────────────────
-  { id: "sam2_tiny",   name: "SAM 2 Tiny",        type: "sam2",  task: "segmentation",       sizeLabel: "38 MB"   },
-  { id: "sam2_small",  name: "SAM 2 Small",       type: "sam2",  task: "segmentation",       sizeLabel: "46 MB"   },
-  { id: "sam2_base",   name: "SAM 2 Base+",       type: "sam2",  task: "segmentation",       sizeLabel: "80 MB"   },
-  { id: "sam2_large",  name: "SAM 2 Large",       type: "sam2",  task: "segmentation",       sizeLabel: "224 MB"  },
-  // ── SAM 2.1 ──────────────────────────────────────────────────────────────────
-  { id: "sam21_tiny",  name: "SAM 2.1 Tiny",      type: "sam2",  task: "segmentation",       sizeLabel: "38 MB"   },
-  { id: "sam21_small", name: "SAM 2.1 Small",     type: "sam2",  task: "segmentation",       sizeLabel: "46 MB"   },
-  { id: "sam21_base",  name: "SAM 2.1 Base+",     type: "sam2",  task: "segmentation",       sizeLabel: "80 MB"   },
-  { id: "sam21_large", name: "SAM 2.1 Large",     type: "sam2",  task: "segmentation",       sizeLabel: "224 MB"  },
-  // ── SAM 3 / 3.1 (gated on HuggingFace) ──────────────────────────────────────
-  { id: "sam3",        name: "SAM 3",             type: "sam3",  task: "segmentation",       sizeLabel: "~3.5 GB", requiresHfToken: true },
-  { id: "sam31",       name: "SAM 3.1",           type: "sam3",  task: "segmentation",       sizeLabel: "~3.5 GB", requiresHfToken: true },
+  { id: "sam3",  name: "SAM 3",   type: "sam3", task: "segmentation", sizeLabel: "~3.5 GB", requiresHfToken: true },
+  { id: "sam31", name: "SAM 3.1", type: "sam3", task: "segmentation", sizeLabel: "~3.5 GB", requiresHfToken: true },
 ]
 
 // Shared localStorage key for the HuggingFace token so both the Models and
@@ -281,7 +221,7 @@ export function ModelsView({ apiUrl = "http://localhost:8000" }: ModelsViewProps
     try {
       const formData = new FormData()
       formData.append("model_file", file)
-      formData.append("model_type", "yolo")
+      formData.append("model_type", "sam3")
       formData.append("model_name", file.name)
 
       const res = await fetch(`${apiUrl}/api/models/load`, {
@@ -307,20 +247,14 @@ export function ModelsView({ apiUrl = "http://localhost:8000" }: ModelsViewProps
   // -------------------------------------------------------------------------
   const getTypeColor = (type: string) => {
     switch (type) {
-      case "yolo":   return "bg-blue-500/10 text-blue-500"
-      case "sam":
-      case "sam2":   return "bg-purple-500/10 text-purple-500"
-      case "sam3":   return "bg-pink-500/10 text-pink-500"
-      case "rfdetr": return "bg-emerald-500/10 text-emerald-500"
-      default:       return "bg-orange-500/10 text-orange-500"
+      case "sam3": return "bg-pink-500/10 text-pink-500"
+      default:     return "bg-orange-500/10 text-orange-500"
     }
   }
 
   const TypeIcon = ({ type }: { type: string }) => {
-    if (type === "yolo") return <Box className="w-6 h-6" />
-    if (type === "sam" || type === "sam2" || type === "sam3") return <FileCode className="w-6 h-6" />
-    if (type === "rfdetr") return <Cpu className="w-6 h-6" />
-    return <Cpu className="w-6 h-6" />
+    if (type === "sam3") return <FileCode className="w-6 h-6" />
+    return <Box className="w-6 h-6" />
   }
 
   // "Your Models" = anything loaded in memory OR downloaded to disk (pretrained
@@ -348,7 +282,7 @@ export function ModelsView({ apiUrl = "http://localhost:8000" }: ModelsViewProps
       <input
         ref={fileInputRef}
         type="file"
-        accept=".pt,.pth,.onnx,.weights"
+        accept=".pt,.pth"
         className="hidden"
         onChange={handleImportModel}
       />
@@ -356,7 +290,7 @@ export function ModelsView({ apiUrl = "http://localhost:8000" }: ModelsViewProps
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-semibold text-foreground">Models</h1>
-          <p className="text-muted-foreground mt-1">Manage and load models for auto-annotation</p>
+          <p className="text-muted-foreground mt-1">Download and manage SAM 3 / SAM 3.1 for auto-annotation</p>
         </div>
         <div className="flex items-center gap-2">
           <Button variant="outline" size="icon" onClick={fetchModels} disabled={isLoading}>
@@ -411,7 +345,7 @@ export function ModelsView({ apiUrl = "http://localhost:8000" }: ModelsViewProps
                   </div>
                   <p className="text-muted-foreground mb-4">No models loaded yet</p>
                   <p className="text-sm text-muted-foreground/70 mb-4">
-                    Download a pretrained model or import a .pt file
+                    Download SAM 3 / SAM 3.1 or import a local checkpoint
                   </p>
                   <Button variant="outline" className="gap-2" onClick={() => fileInputRef.current?.click()}>
                     <Upload className="w-4 h-4" />
@@ -509,7 +443,7 @@ export function ModelsView({ apiUrl = "http://localhost:8000" }: ModelsViewProps
               <Download className="w-5 h-5 text-primary" />
               Download Models
             </CardTitle>
-            <CardDescription>Download and load pretrained models via the backend</CardDescription>
+            <CardDescription>SAM 3 / SAM 3.1 — gated on HuggingFace, token required</CardDescription>
           </CardHeader>
           <CardContent>
             <div className="space-y-2 max-h-[520px] overflow-auto">

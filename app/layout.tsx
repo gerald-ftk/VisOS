@@ -6,9 +6,9 @@ import { Toaster } from '@/components/ui/sonner'
 import './globals.css'
 
 export const metadata: Metadata = {
-  title: 'CV Dataset Manager',
-  description: 'Professional Computer Vision Dataset Management Suite - Annotate, Sort, Convert, Merge, and Train',
-  keywords: ['computer vision', 'dataset', 'annotation', 'yolo', 'coco', 'machine learning', 'deep learning'],
+  title: 'VisOS',
+  description: 'Locally-run image annotation tool with SAM 3 / SAM 3.1 support',
+  keywords: ['computer vision', 'dataset', 'annotation', 'sam', 'sam3', 'segmentation'],
 }
 
 export const viewport: Viewport = {

@@ -1,3 +1,3 @@
 @echo off
 cd /d "%~dp0"
-python run.py %*
+uv run app.py %*

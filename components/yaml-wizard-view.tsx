@@ -465,7 +465,7 @@ export function YamlWizardView({ selectedDataset, apiUrl }: { selectedDataset: D
         const data = await r.json()
         setYamlPreview(data.preview)
         setPhase('done')
-        toast.success(`data.yaml saved to dataset — training is now ready`)
+        toast.success(`data.yaml saved to dataset`)
       } catch (e) {
         toast.error(e instanceof Error ? e.message : 'Save failed')
       } finally {
@@ -569,7 +569,7 @@ export function YamlWizardView({ selectedDataset, apiUrl }: { selectedDataset: D
           <p className="font-semibold text-green-500">data.yaml saved to dataset</p>
           <p className="text-sm text-muted-foreground mt-0.5">
             The file has been written into <strong>{selectedDataset.name}</strong>'s directory.
-            Training jobs will now find it automatically.
+            External training pipelines will now find it automatically.
           </p>
           <p className="text-xs text-muted-foreground mt-1 font-mono">{wizardData.dataset_path}/data.yaml</p>
         </div>

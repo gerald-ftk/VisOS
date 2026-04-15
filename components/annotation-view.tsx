@@ -773,7 +773,7 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
 
     // The backend tags every SAM mask "object" / class_id 0 — that's what
     // the model produced, not what the user wants. Override with the
-    // active class (same as manual bboxes) so YOLO export maps correctly.
+    // active class (same as manual bboxes) so format export maps correctly.
     const resolvedClass = activeClass || localClasses[0] || 'object'
     const resolvedClassId = Math.max(0, localClasses.indexOf(resolvedClass))
     const tagAnnotations = (anns: Annotation[]): Annotation[] =>
@@ -960,7 +960,7 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
         model_id: selectedModel,
         confidence_threshold: String(confidence),
       })
-      // Pass text prompt for zero-shot models (YOLO-World, GroundingDINO)
+      // Pass text prompt for SAM 3 concept segmentation
       if (combinedPrompt) params.set('text_prompt', combinedPrompt)
       if (currentImage.path) params.set('image_path_hint', currentImage.path)
       const resp = await fetch(
@@ -1736,12 +1736,12 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
           </Button>
         </div>
 
-        {/* Text prompt section — shown for SAM3, YOLO-World, and GroundingDINO */}
+        {/* Text prompt section — shown for SAM 3 concept segmentation */}
         {(() => {
           const selModel = models.find(m => m.id === selectedModel)
-          const isTextModel = selModel && ['sam3', 'yoloworld', 'groundingdino'].includes(selModel.type)
+          const isTextModel = selModel && selModel.type === 'sam3'
           if (!isTextModel) return null
-          const sectionLabel = selModel.type === 'sam3' ? 'Text Segment' : 'Text Detect (Zero-Shot)'
+          const sectionLabel = 'Text Segment'
           return (
             <div className="p-3 space-y-2.5 border-b border-border">
               {/* Section label */}
