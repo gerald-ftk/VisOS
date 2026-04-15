@@ -1340,16 +1340,26 @@ class ModelManager:
                     elif prompt_points:
                         # Point-prompted: list of {x, y, label} in normalized
                         # coordinates. Multiple positive/negative points refine
-                        # a single mask — standard SAM interactive usage.
+                        # a SINGLE mask — standard SAM interactive usage.
+                        #
+                        # Shape matters: ultralytics' `_prepare_prompts` treats a
+                        # flat (N, 2) points array as N *separate* objects with
+                        # one point each (see predict.py:314 `points[:, None, :]`).
+                        # That produces 8 independent single-point segmentations
+                        # — negative clicks in particular become nonsense — and
+                        # the downstream "pick highest score" then returns a
+                        # garbage mask. Passing (1, N, 2) / (1, N) tells SAM
+                        # "one object, refined by these N points", which is what
+                        # the user clicked for.
                         pts_px = [
                             [int(p["x"] * w), int(p["y"] * h)] for p in prompt_points
                         ]
-                        lbls  = [int(p.get("label", 1)) for p in prompt_points]
+                        lbls = [int(p.get("label", 1)) for p in prompt_points]
                         try:
                             results = model(
                                 str(image_path),
-                                points=pts_px,
-                                labels=lbls,
+                                points=[pts_px],
+                                labels=[lbls],
                                 verbose=False,
                                 device=device,
                             )
