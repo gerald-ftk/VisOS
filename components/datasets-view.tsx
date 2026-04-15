@@ -147,7 +147,14 @@ export function DatasetsView({
       }
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : String(err)
-      setError(errorMsg === '[object Object]' ? 'Failed to load dataset - check folder path' : errorMsg)
+      // Clear the "Loading dataset from..." status so the user isn't left
+      // staring at a stale progress message while the error is shown.
+      setSuccess(null)
+      setError(
+        !errorMsg || errorMsg === '[object Object]'
+          ? 'Failed to load dataset - check folder path'
+          : errorMsg
+      )
     } finally {
       setIsLoadingFolder(false)
     }

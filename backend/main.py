@@ -2476,59 +2476,10 @@ async def serve_image(dataset_id: str, image_path: str):
 
 
 # ============== LOCAL FOLDER MODE ==============
-
-class LocalFolderRequest(BaseModel):
-    folder_path: str
-    dataset_name: Optional[str] = None
-    format_hint: Optional[str] = None
-
-
-@app.post("/api/datasets/load-local")
-async def load_local_dataset(request: LocalFolderRequest):
-    """Load a dataset from a local folder path (no upload required)"""
-    folder_path = Path(request.folder_path)
-    
-    if not folder_path.exists():
-        raise HTTPException(status_code=404, detail=f"Folder not found: {request.folder_path}")
-    
-    if not folder_path.is_dir():
-        raise HTTPException(status_code=400, detail="Path is not a directory")
-    
-    dataset_id = str(uuid.uuid4())
-    
-    # Create symlink or copy based on preference
-    dataset_link = DATASETS_DIR / dataset_id
-    
-    try:
-        # Create symlink to avoid copying large datasets
-        dataset_link.symlink_to(folder_path.absolute())
-    except OSError:
-        # If symlink fails (e.g., on Windows), copy the dataset
-        shutil.copytree(folder_path, dataset_link)
-    
-    try:
-        # Parse dataset
-        dataset_info = dataset_parser.parse_dataset(
-            dataset_link,
-            format_hint=request.format_hint,
-            name=request.dataset_name or folder_path.name
-        )
-        
-        dataset_info["id"] = dataset_id
-        dataset_info["local_path"] = str(folder_path.absolute())
-        dataset_info["is_local"] = True
-        active_datasets[dataset_id] = dataset_info
-        _save_dataset_metadata(dataset_id, dataset_info)
-        
-        return {"success": True, "dataset": dataset_info}
-    
-    except Exception as e:
-        # Cleanup on failure
-        if dataset_link.is_symlink():
-            dataset_link.unlink()
-        else:
-            shutil.rmtree(dataset_link, ignore_errors=True)
-        raise HTTPException(status_code=400, detail=str(e))
+# Note: LocalFolderRequest and the load-local endpoint are defined further
+# below alongside the browse-folders endpoint. The older duplicate that
+# lived here expected a `folder_path` field and was shadowing the newer
+# `path`-based version via first-registered route matching in Starlette.
 
 
 @app.post("/api/datasets/browse-folders")
@@ -3217,7 +3168,8 @@ async def load_local_dataset(request: LocalFolderRequest):
         dataset_info["local_path"] = str(folder_path)
         dataset_info["is_local"] = True
         active_datasets[dataset_id] = dataset_info
-        
+        _save_dataset_metadata(dataset_id, dataset_info)
+
         return {"success": True, "dataset": dataset_info}
     
     except Exception as e:
