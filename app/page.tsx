@@ -161,6 +161,19 @@ export default function Home() {
     return () => window.removeEventListener('popstate', handlePopState)
   }, [])
 
+  // Re-point selectedDataset at the fresh object whenever the datasets list
+  // changes. Views call setDatasets with an updated entry (e.g. after adding
+  // a class), but without this sync selectedDataset keeps a stale reference
+  // and downstream consumers like class-management-view and annotation-view
+  // never see the change.
+  useEffect(() => {
+    if (!selectedDataset) return
+    const fresh = datasets.find(d => d.id === selectedDataset.id)
+    if (fresh && fresh !== selectedDataset) {
+      setSelectedDataset(fresh)
+    }
+  }, [datasets, selectedDataset])
+
   // Navigate to a view — updates React state AND the browser URL without remounting
   const setActiveView = useCallback((view: ViewType) => {
     setActiveViewState(view)

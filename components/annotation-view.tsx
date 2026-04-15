@@ -150,8 +150,24 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
   useEffect(() => { currentImageRef.current = currentImage }, [currentImage])
   useEffect(() => { selectedDatasetRef.current = selectedDataset }, [selectedDataset])
   useEffect(() => { annotationsRef.current = annotations }, [annotations])
-  // Sync localClasses when dataset changes
-  useEffect(() => { setLocalClasses(selectedDataset?.classes || []) }, [selectedDataset?.id])
+  // Sync localClasses when dataset changes. Seed from selectedDataset.classes
+  // for an instant render, then fetch /api/datasets/{id}/classes so the
+  // dropdown reflects anything the user added after this component mounted
+  // (e.g. a fresh class added on the Classes page).
+  useEffect(() => {
+    if (!selectedDataset?.id) { setLocalClasses([]); return }
+    setLocalClasses(selectedDataset.classes || [])
+    let cancelled = false
+    fetch(`${apiUrl}/api/datasets/${selectedDataset.id}/classes`)
+      .then(r => r.ok ? r.json() : null)
+      .then(data => {
+        if (cancelled || !data) return
+        const names = Object.keys(data.classes || {})
+        if (names.length > 0) setLocalClasses(names)
+      })
+      .catch(() => {})
+    return () => { cancelled = true }
+  }, [selectedDataset?.id, apiUrl])
 
   // ── Clear all poll intervals on unmount ───────────────────────────────────────
   useEffect(() => {
