@@ -481,6 +481,46 @@ class ModelManager:
             model_info["error"] = "SAM package not installed (ultralytics also failed)"
         return model_info
 
+    # Cache of SAM3 semantic predictors keyed by weights path. Semantic mode
+    # (SAM3SemanticPredictor) uses a different sub-model than the interactive
+    # predictor, so we keep a separate instance and lazily build it the first
+    # time a text prompt comes in.
+    _sam3_semantic_cache: Dict[str, Any] = {}
+
+    def _get_sam3_semantic_predictor(self, weights_path: str, device: str):
+        """Lazily build a SAM3SemanticPredictor and cache it by weights path.
+
+        Ultralytics' public `SAM` class hardcodes `build_interactive_sam3`
+        in `SAM._load`, which produces a model that has no `backbone`
+        attribute that SAM3SemanticPredictor needs. Building the predictor
+        directly lets its own `get_model()` call `build_sam3_image_model`,
+        which produces the right semantic-mode model.
+        """
+        cached = self._sam3_semantic_cache.get(weights_path)
+        if cached is not None:
+            return cached
+        try:
+            from ultralytics.models.sam import SAM3SemanticPredictor
+
+            overrides = dict(
+                model=str(weights_path),
+                task="segment",
+                mode="predict",
+                imgsz=1024,
+                conf=0.25,
+                save=False,
+                verbose=False,
+                device=device if device in ("cpu", "mps") or str(device).startswith("cuda") else None,
+            )
+            # Filter out any Nones so ultralytics picks its own defaults.
+            overrides = {k: v for k, v in overrides.items() if v is not None}
+            predictor = SAM3SemanticPredictor(overrides=overrides)
+            self._sam3_semantic_cache[weights_path] = predictor
+            return predictor
+        except Exception as exc:
+            print(f"[sam3_semantic] Could not build SAM3SemanticPredictor: {exc}")
+            return None
+
     def _try_load_sam_ultralytics(self, model_path: str, model_info: Dict) -> bool:
         """Try loading a SAM/SAM2/SAM2.1/SAM3 checkpoint via ultralytics. Returns True on success."""
         try:
@@ -1011,6 +1051,7 @@ class ModelManager:
         image_id: str,
         confidence_threshold: float = 0.5,
         prompt_point: Optional[tuple] = None,
+        prompt_points: Optional[List[Dict[str, Any]]] = None,
         text_prompt: Optional[str] = None,
         image_path_hint: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
@@ -1052,10 +1093,14 @@ class ModelManager:
         if not image_file:
             return []
 
+        # Migrate legacy single-point callers into the new prompt_points shape.
+        if prompt_points is None and prompt_point is not None:
+            prompt_points = [{"x": prompt_point[0], "y": prompt_point[1], "label": 1}]
+
         try:
             annotations = self._run_inference(
                 model, model_type, image_file, confidence_threshold,
-                prompt_point=prompt_point,
+                prompt_points=prompt_points,
                 text_prompt=text_prompt,
                 model_classes=model_info.get("classes") or [],
             )
@@ -1069,7 +1114,7 @@ class ModelManager:
         model_type: str,
         image_path: Path,
         confidence_threshold: float,
-        prompt_point: Optional[tuple] = None,
+        prompt_points: Optional[List[Dict[str, Any]]] = None,
         text_prompt: Optional[str] = None,
         model_classes: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
@@ -1149,81 +1194,156 @@ class ModelManager:
                     if text_prompt is not None:
                         texts = [t.strip() for t in text_prompt.split(",") if t.strip()] or [text_prompt]
 
-                        # ── Stage 1: try SAM native text grounding (low conf) ──
-                        # SAM2.1 + GroundingDINO works here; SAM3 might not have
-                        # a text encoder — we fall through to Stage 2 if empty.
-                        try:
-                            native_results = model(
-                                str(image_path), texts=texts,
-                                conf=0.1, verbose=False, device=device
+                        if model_type == "sam3":
+                            # SAM 3 / 3.1 have native text grounding — but only
+                            # through SAM3SemanticPredictor, which builds a
+                            # *different* sub-model than the interactive
+                            # predictor ultralytics' SAM class wires up by
+                            # default. Resolve the weights path from the
+                            # cached model_info and build the predictor.
+                            weights_path = None
+                            for info in self.loaded_models.values():
+                                if info.get("model") is model and info.get("path"):
+                                    weights_path = info["path"]
+                                    break
+                            sem_predictor = (
+                                self._get_sam3_semantic_predictor(weights_path, device)
+                                if weights_path else None
                             )
-                            for result in native_results:
-                                if result.masks is None:
-                                    continue
-                                result_boxes = result.boxes
-                                for i, mask_xy in enumerate(result.masks.xy):
-                                    cls_name = texts[0] if len(texts) == 1 else "object"
-                                    if result_boxes is not None and i < len(result_boxes):
-                                        try:
-                                            cls_id = int(result_boxes[i].cls[0])
-                                            cls_name = texts[cls_id] if cls_id < len(texts) else texts[0]
-                                        except Exception:
-                                            pass
-                                    ann = _mask_xy_to_annotation(mask_xy, cls_name)
-                                    if ann:
-                                        annotations.append(ann)
-                        except Exception:
-                            pass  # Native text not supported by this model
-
-                        # ── Stage 2: YOLO-World → boxes → SAM masks ────────────
-                        # Reliable two-stage pipeline: YOLO-World detects regions
-                        # matching the text labels; SAM turns those boxes into masks.
-                        if not annotations:
-                            try:
-                                from ultralytics import YOLOWorld
-                                # Use the small variant (~100 MB); ultralytics caches it
-                                world = YOLOWorld("yolov8s-worldv2.pt")
-                                self._apply_device_to_model(world)
-                                world.set_classes(texts)
-                                det = world(
-                                    str(image_path), conf=0.1,
-                                    verbose=False, device=device
-                                )
-                                if det and det[0].boxes is not None and len(det[0].boxes):
-                                    boxes_xyxy = det[0].boxes.xyxy.tolist()
-                                    cls_ids    = [int(c) for c in det[0].boxes.cls.tolist()]
-                                    box_names  = [
-                                        texts[cid] if cid < len(texts) else texts[0]
-                                        for cid in cls_ids
-                                    ]
-                                    # Use SAM to generate masks from detected boxes
-                                    sam_results = model(
-                                        str(image_path), bboxes=boxes_xyxy,
-                                        verbose=False, device=device
-                                    )
-                                    for result in sam_results:
+                            if sem_predictor is None:
+                                print("[sam3_text] semantic predictor unavailable; no fallback")
+                            else:
+                                try:
+                                    # Tell the predictor to use this image's
+                                    # confidence threshold for its class filter.
+                                    sem_predictor.args.conf = max(0.05, confidence_threshold * 0.5)
+                                    sem_predictor.set_prompts({"text": texts})
+                                    # Predictors return a generator; wrap in list.
+                                    results = list(sem_predictor(source=str(image_path)))
+                                    for result in results:
                                         if result.masks is None:
                                             continue
+                                        result_boxes = result.boxes
                                         for i, mask_xy in enumerate(result.masks.xy):
-                                            cls_name = box_names[i] if i < len(box_names) else texts[0]
+                                            cls_name = texts[0] if len(texts) == 1 else "object"
+                                            if result_boxes is not None and i < len(result_boxes):
+                                                try:
+                                                    cls_id = int(result_boxes[i].cls[0])
+                                                    cls_name = texts[cls_id] if cls_id < len(texts) else texts[0]
+                                                except Exception:
+                                                    pass
                                             ann = _mask_xy_to_annotation(mask_xy, cls_name)
                                             if ann:
                                                 annotations.append(ann)
-                            except Exception as yolo_world_err:
-                                print(f"[text_seg] YOLO-World stage failed: {yolo_world_err}")
+                                except Exception as exc:
+                                    print(f"[sam3_text] SAM3SemanticPredictor failed: {exc}")
+                            # Deliberately no YOLO-World fallback for SAM 3.
+                            # SAM 3 has native text grounding; if it fails here
+                            # we surface the empty result rather than silently
+                            # downloading a 100 MB YOLO-World model — which was
+                            # confusing and slow, and produced masks that didn't
+                            # match the user's expectations for SAM 3 quality.
+                        else:
+                            # SAM / SAM 2 / SAM 2.1: try native text (SAM2 + GD).
+                            try:
+                                native_results = model(
+                                    str(image_path), texts=texts,
+                                    conf=0.1, verbose=False, device=device
+                                )
+                                for result in native_results:
+                                    if result.masks is None:
+                                        continue
+                                    result_boxes = result.boxes
+                                    for i, mask_xy in enumerate(result.masks.xy):
+                                        cls_name = texts[0] if len(texts) == 1 else "object"
+                                        if result_boxes is not None and i < len(result_boxes):
+                                            try:
+                                                cls_id = int(result_boxes[i].cls[0])
+                                                cls_name = texts[cls_id] if cls_id < len(texts) else texts[0]
+                                            except Exception:
+                                                pass
+                                        ann = _mask_xy_to_annotation(mask_xy, cls_name)
+                                        if ann:
+                                            annotations.append(ann)
+                            except Exception:
+                                pass
 
-                    elif prompt_point is not None:
-                        # Point-prompted: clicked pixel coordinates (normalized → pixel)
-                        px = int(prompt_point[0] * w)
-                        py = int(prompt_point[1] * h)
-                        results = model(str(image_path), points=[[px, py]], labels=[1], verbose=False, device=device)
+                            # Fallback: YOLO-World → boxes → SAM masks.
+                            if not annotations:
+                                try:
+                                    from ultralytics import YOLOWorld
+                                    world = YOLOWorld("yolov8s-worldv2.pt")
+                                    self._apply_device_to_model(world)
+                                    world.set_classes(texts)
+                                    det = world(
+                                        str(image_path), conf=0.1,
+                                        verbose=False, device=device
+                                    )
+                                    if det and det[0].boxes is not None and len(det[0].boxes):
+                                        boxes_xyxy = det[0].boxes.xyxy.tolist()
+                                        cls_ids    = [int(c) for c in det[0].boxes.cls.tolist()]
+                                        box_names  = [
+                                            texts[cid] if cid < len(texts) else texts[0]
+                                            for cid in cls_ids
+                                        ]
+                                        sam_results = model(
+                                            str(image_path), bboxes=boxes_xyxy,
+                                            verbose=False, device=device
+                                        )
+                                        for result in sam_results:
+                                            if result.masks is None:
+                                                continue
+                                            for i, mask_xy in enumerate(result.masks.xy):
+                                                cls_name = box_names[i] if i < len(box_names) else texts[0]
+                                                ann = _mask_xy_to_annotation(mask_xy, cls_name)
+                                                if ann:
+                                                    annotations.append(ann)
+                                except Exception as yolo_world_err:
+                                    print(f"[text_seg] YOLO-World stage failed: {yolo_world_err}")
+
+                    elif prompt_points:
+                        # Point-prompted: list of {x, y, label} in normalized
+                        # coordinates. Multiple positive/negative points refine
+                        # a single mask — standard SAM interactive usage.
+                        pts_px = [
+                            [int(p["x"] * w), int(p["y"] * h)] for p in prompt_points
+                        ]
+                        lbls  = [int(p.get("label", 1)) for p in prompt_points]
+                        try:
+                            results = model(
+                                str(image_path),
+                                points=pts_px,
+                                labels=lbls,
+                                verbose=False,
+                                device=device,
+                            )
+                        except Exception as exc:
+                            print(f"[sam_point] interactive predict failed: {exc}")
+                            results = []
                         for result in results:
                             if result.masks is None:
                                 continue
-                            for mask_xy in result.masks.xy:
-                                ann = _mask_xy_to_annotation(mask_xy)
+                            # Pick the single best-scored mask when multiple
+                            # masks come back — multimask_output=True can return
+                            # three candidates; the highest IoU is the one the
+                            # user most likely wants.
+                            scores = None
+                            if result.boxes is not None:
+                                try:
+                                    scores = result.boxes.conf.cpu().numpy().tolist()
+                                except Exception:
+                                    scores = None
+                            mask_xys = list(result.masks.xy)
+                            if scores and len(scores) == len(mask_xys):
+                                best = int(max(range(len(scores)), key=lambda i: scores[i]))
+                                ann = _mask_xy_to_annotation(mask_xys[best])
                                 if ann:
                                     annotations.append(ann)
+                            else:
+                                for mask_xy in mask_xys:
+                                    ann = _mask_xy_to_annotation(mask_xy)
+                                    if ann:
+                                        annotations.append(ann)
 
                     else:
                         # No prompt — segment everything (grid/automatic mode)

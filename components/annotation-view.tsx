@@ -96,6 +96,12 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
 
   // SAM state
   const [isSamLoading, setIsSamLoading] = useState(false)
+  // Accumulated click-points for SAM interactive prompting. Coordinates are
+  // normalized [0,1] relative to the original image. label: 1 = positive
+  // (include), 0 = negative (exclude). The backend re-runs SAM with ALL
+  // current points on each click, so the mask refines as the user adds
+  // positive/negative points.
+  const [samPoints, setSamPoints] = useState<Array<{ x: number; y: number; label: 0 | 1 }>>([])
 
   // Keypoint state
   const [keypointList, setKeypointList] = useState<{ x: number; y: number; label: string }[]>([])
@@ -128,6 +134,11 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
   const currentImageRef = useRef<ImageData | null>(null)
   const selectedDatasetRef = useRef<Dataset | null>(null)
   const annotationsRef = useRef<Annotation[]>([])
+  // Snapshot of the user's annotations *before* the current SAM interactive
+  // prompting session began. Subsequent clicks within the same session
+  // (adding positive/negative points) replace the last SAM-produced mask
+  // relative to this snapshot instead of piling up new masks.
+  const samMasksBeforeRef = useRef<Annotation[] | null>(null)
   // Track active poll intervals so we never start two for the same job
   const pollIntervalsRef = useRef<Record<string, ReturnType<typeof setInterval>>>({})
   // When true, the allImages useEffect skips the reset-to-index-0 behaviour
@@ -381,6 +392,9 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
     setTempBox(null)
     setHistory([])
     setHistoryIndex(-1)
+    // Clear any in-flight SAM prompt points; they belong to the previous image.
+    setSamPoints([])
+    samMasksBeforeRef.current = null
     imageRef.current = null
 
     return new Promise<void>((resolve) => {
@@ -430,7 +444,8 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
     tBox: { x: number; y: number; w: number; h: number } | null,
     polyPts: { x: number; y: number }[],
     zoomLevel = zoom,
-    kpList: { x: number; y: number; label: string }[] = []
+    kpList: { x: number; y: number; label: string }[] = [],
+    samPts: Array<{ x: number; y: number; label: 0 | 1 }> = []
   ) => {
     const canvas = canvasRef.current
     const container = containerRef.current
@@ -548,15 +563,48 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
         ctx.fillText(kp.label || String(i + 1), px + 8, py - 4)
       })
     }
+
+    // Draw SAM interactive prompt points so the user can see exactly where
+    // the model was told to look. Green = positive (include), red = negative
+    // (exclude). Shift-click adds a negative point.
+    if (samPts.length > 0) {
+      samPts.forEach((pt) => {
+        const px = pt.x * img.width * scale
+        const py = pt.y * img.height * scale
+        const color = pt.label === 1 ? '#22c55e' : '#ef4444'
+        // White outline ring for contrast over any image
+        ctx.beginPath()
+        ctx.arc(px, py, 8, 0, Math.PI * 2)
+        ctx.fillStyle = '#ffffff'
+        ctx.fill()
+        // Coloured inner dot
+        ctx.beginPath()
+        ctx.arc(px, py, 6, 0, Math.PI * 2)
+        ctx.fillStyle = color
+        ctx.fill()
+        // Dark outline so it stays visible on bright backgrounds
+        ctx.strokeStyle = '#0a0a0a'
+        ctx.lineWidth = 1.5
+        ctx.stroke()
+        // ± glyph in the centre
+        ctx.fillStyle = '#ffffff'
+        ctx.font = 'bold 9px sans-serif'
+        ctx.textAlign = 'center'
+        ctx.textBaseline = 'middle'
+        ctx.fillText(pt.label === 1 ? '+' : '−', px, py)
+        ctx.textAlign = 'start'
+        ctx.textBaseline = 'alphabetic'
+      })
+    }
   }, [zoom])
 
   const drawCanvas = useCallback(() => {
-    if (imageRef.current) drawCanvasWithData(imageRef.current, annotations, selectedAnnotation, tempBox, polygonPoints, zoom, keypointList)
-  }, [annotations, selectedAnnotation, tempBox, polygonPoints, zoom, keypointList, drawCanvasWithData])
+    if (imageRef.current) drawCanvasWithData(imageRef.current, annotations, selectedAnnotation, tempBox, polygonPoints, zoom, keypointList, samPoints)
+  }, [annotations, selectedAnnotation, tempBox, polygonPoints, zoom, keypointList, samPoints, drawCanvasWithData])
 
   useEffect(() => {
     if (!isImageLoading && imageRef.current) drawCanvas()
-  }, [annotations, selectedAnnotation, zoom, isImageLoading, keypointList])
+  }, [annotations, selectedAnnotation, zoom, isImageLoading, keypointList, samPoints])
 
   // ── Canvas interaction ───────────────────────────────────────────────────────
   const getCanvasCoords = (e: React.MouseEvent<HTMLCanvasElement>) => {
@@ -576,7 +624,7 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
     } else if (activeTool === 'polygon') {
       const newPts = [...polygonPoints, coords]
       setPolygonPoints(newPts)
-      if (imageRef.current) drawCanvasWithData(imageRef.current, annotations, selectedAnnotation, tempBox, newPts, zoom)
+      if (imageRef.current) drawCanvasWithData(imageRef.current, annotations, selectedAnnotation, tempBox, newPts, zoom, keypointList, samPoints)
     } else if (activeTool === 'brush') {
       setIsBrushing(true)
       setBrushPoints([coords])
@@ -588,9 +636,11 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
       const newKps = [...keypointList, kp]
       setKeypointList(newKps)
       // Redraw with keypoints shown
-      if (imageRef.current) drawCanvasWithData(imageRef.current, annotations, selectedAnnotation, tempBox, polygonPoints, zoom, newKps)
+      if (imageRef.current) drawCanvasWithData(imageRef.current, annotations, selectedAnnotation, tempBox, polygonPoints, zoom, newKps, samPoints)
     } else if (activeTool === 'sam') {
-      handleSamClick(coords)
+      // Shift / Alt / Ctrl → negative point (exclude). Plain click → positive.
+      const negative = e.shiftKey || e.altKey || e.ctrlKey
+      handleSamClick(coords, negative)
     } else {
       // In select mode: if clicking on already-selected bbox, start drag
       if (activeTool === 'select' && selectedAnnotation !== null) {
@@ -642,7 +692,7 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
     const c = getCanvasCoords(e)
     const box = { x: Math.min(drawStart.x, c.x), y: Math.min(drawStart.y, c.y), w: Math.abs(c.x - drawStart.x), h: Math.abs(c.y - drawStart.y) }
     setTempBox(box)
-    if (imageRef.current) drawCanvasWithData(imageRef.current, annotations, selectedAnnotation, box, polygonPoints, zoom, keypointList)
+    if (imageRef.current) drawCanvasWithData(imageRef.current, annotations, selectedAnnotation, box, polygonPoints, zoom, keypointList, samPoints)
   }
 
   const handleCanvasMouseUp = () => {
@@ -693,24 +743,38 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
     setIsDrawing(false); setDrawStart(null); setTempBox(null)
   }
 
-  const handleSamClick = async (coords: { x: number; y: number }) => {
+  const handleSamClick = async (coords: { x: number; y: number }, negative: boolean = false) => {
     if (!selectedDataset || !currentImage || !selectedModel) {
       toast.error('Select a SAM-compatible model first')
       return
     }
-    setIsSamLoading(true)
     const scale = scaleRef.current
     const img = imageRef.current
-    if (!img) { setIsSamLoading(false); return }
-    // Normalize coordinates
-    const px = coords.x / scale / img.width
-    const py = coords.y / scale / img.height
+    if (!img) return
+    // Normalize coordinates to [0,1] in source image space so the backend
+    // can map them back to pixels regardless of canvas zoom/resize.
+    const x = coords.x / scale / img.width
+    const y = coords.y / scale / img.height
+    const newPoint: { x: number; y: number; label: 0 | 1 } = {
+      x, y, label: negative ? 0 : 1,
+    }
+    // Remember the set of points we were dragging with (for the snapshot
+    // below) and for the follow-up setState so re-renders see a stable list.
+    const pointsForRequest = [...samPoints, newPoint]
+    // Snapshot the previous annotations so we can substitute SAM's latest
+    // refined mask in place of the one from the previous click — otherwise
+    // each click would pile up masks instead of refining the current one.
+    const masksBeforeThisClick = samPoints.length > 0 ? samMasksBeforeRef.current : annotationsRef.current
+    if (samPoints.length === 0) {
+      samMasksBeforeRef.current = annotationsRef.current
+    }
+    setSamPoints(pointsForRequest)
+    setIsSamLoading(true)
     try {
       const params = new URLSearchParams({
         model_id: selectedModel,
         confidence_threshold: String(confidence),
-        point_x: String(px),
-        point_y: String(py),
+        points_json: JSON.stringify(pointsForRequest),
       })
       if (currentImage.path) params.set('image_path_hint', currentImage.path)
       const resp = await fetch(
@@ -720,35 +784,25 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
       if (!resp.ok) throw new Error('SAM failed')
       const data = await resp.json()
       if (data.annotations?.length) {
-        const next = [...annotationsRef.current, ...data.annotations]
+        // Replace the previous SAM refinement (if any) with the new mask,
+        // keeping any unrelated annotations the user had before.
+        const next = [...masksBeforeThisClick, ...data.annotations]
         setAnnotations(next)
         saveToHistory(next)
         await saveAnnotations(false, next)
-        toast.success(`SAM generated ${data.annotations.length} mask(s)`)
       } else {
-        // Fallback: just run standard auto-annotate
-        const fbParams = new URLSearchParams({ model_id: selectedModel, confidence_threshold: String(confidence) })
-        if (currentImage.path) fbParams.set('image_path_hint', currentImage.path)
-        const fallbackResp = await fetch(
-          `${apiUrl}/api/auto-annotate/${selectedDataset.id}/single/${currentImage.id}?${fbParams}`,
-          { method: 'POST' }
-        )
-        const fallbackData = await fallbackResp.json()
-        if (fallbackData.annotations?.length) {
-          const next = [...annotationsRef.current, ...fallbackData.annotations]
-          setAnnotations(next)
-          saveToHistory(next)
-          await saveAnnotations(false, next)
-          toast.success('Auto-annotated (SAM point not supported by this model)')
-        } else {
-          toast.info('No objects detected at that point')
-        }
+        toast.info('No mask for those points')
       }
     } catch {
       toast.error('SAM annotation failed')
     } finally {
       setIsSamLoading(false)
     }
+  }
+
+  const clearSamPoints = () => {
+    setSamPoints([])
+    samMasksBeforeRef.current = null
   }
 
   const commitKeypoints = () => {
@@ -1494,8 +1548,16 @@ export function AnnotationView({ selectedDataset, apiUrl, imageCache, updateImag
               )}
               {activeTool === 'sam' && (
                 <div className="absolute top-4 left-1/2 -translate-x-1/2 bg-green-500/90 text-white text-xs px-3 py-1.5 rounded-full font-medium shadow pointer-events-none">
-                  SAM mode — click a point on an object to auto-segment it
-                  {isSamLoading && ' (processing...)'}
+                  SAM mode — click to add a positive point, Shift/Alt/Ctrl-click for negative
+                  {samPoints.length > 0 && ` · ${samPoints.length} pt${samPoints.length === 1 ? '' : 's'}`}
+                  {isSamLoading && ' · processing…'}
+                </div>
+              )}
+              {samPoints.length > 0 && activeTool === 'sam' && (
+                <div className="absolute bottom-16 right-2 flex gap-2">
+                  <Button size="sm" variant="outline" onClick={clearSamPoints}>
+                    Clear {samPoints.length} point{samPoints.length === 1 ? '' : 's'}
+                  </Button>
                 </div>
               )}
               {keypointList.length > 0 && activeTool === 'keypoint' && (

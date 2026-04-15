@@ -1551,17 +1551,42 @@ async def auto_annotate_single_image(
     confidence_threshold: float = 0.5,
     point_x: Optional[float] = None,
     point_y: Optional[float] = None,
+    points_json: Optional[str] = None,
     text_prompt: Optional[str] = None,
     image_path_hint: Optional[str] = None,
 ):
-    """Auto-annotate a single image, with optional SAM click-point or text prompt."""
+    """Auto-annotate a single image, with optional SAM click-point(s) or text prompt.
+
+    Accepts either:
+    - `points_json`: a JSON-encoded list of {"x": float, "y": float, "label": 0|1}
+      where coordinates are normalized to [0,1] and label 1 = positive,
+      0 = negative. SAM refines a single mask using all points at once.
+    - Legacy `point_x`/`point_y` for a single positive point.
+    """
     if dataset_id not in active_datasets:
         raise HTTPException(status_code=404, detail="Dataset not found")
 
     dataset = active_datasets[dataset_id]
     dataset_path = DATASETS_DIR / dataset_id
 
-    prompt_point = (point_x, point_y) if point_x is not None and point_y is not None else None
+    prompt_points: Optional[List[Dict[str, Any]]] = None
+    if points_json:
+        try:
+            parsed = json.loads(points_json)
+            if not isinstance(parsed, list):
+                raise ValueError("points_json must be a JSON list")
+            prompt_points = [
+                {
+                    "x": float(p["x"]),
+                    "y": float(p["y"]),
+                    "label": int(p.get("label", 1)),
+                }
+                for p in parsed
+            ]
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid points_json: {exc}")
+    elif point_x is not None and point_y is not None:
+        prompt_points = [{"x": point_x, "y": point_y, "label": 1}]
 
     annotations = model_manager.annotate_single_image(
         model_id,
@@ -1569,7 +1594,7 @@ async def auto_annotate_single_image(
         dataset["format"],
         image_id,
         confidence_threshold,
-        prompt_point=prompt_point,
+        prompt_points=prompt_points,
         text_prompt=text_prompt or None,
         image_path_hint=image_path_hint,
     )
